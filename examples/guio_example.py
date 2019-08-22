@@ -27,7 +27,7 @@ async def drawing_canvas():
 
     try:
 
-        for event in guio.aevents()
+        async for event in guio.aevents():
             event_type = str(event.type)
             if event_type in {"Motion", "Enter"}:
                 if x is None:
@@ -60,10 +60,10 @@ async def drawing_canvas():
             else:
                 last = None
 
-    except tkio.CloseWindow:
+    except guio.CloseWindow:
         pass
 
 
 
 if __name__ == "__main__":
-    tkio.run(drawing_canvas())
+    guio.run(drawing_canvas())
