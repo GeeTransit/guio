@@ -11,14 +11,19 @@ import guio
 
 async def main():
     await guio.set_current_event()
-    toplevel = guio.current_toplevel()
+
+    toplevel = await guio.current_toplevel()
     canvas = tkinter.Canvas(toplevel, highlightthickness=0)
     canvas.pack(expand=True, fill=tkinter.BOTH)
 
-    async for event in guio.aevents():
-        if event.type in {tkinter.EventType.Motion, tkinter.EventType.Enter}:
-            x, y = event.x, event.y
-            canvas.create_line(x-2, y-2, x+2, y+2)
+    try:
+        async for event in guio.aevents():
+            if event.type in {tkinter.EventType.Motion, tkinter.EventType.Enter}:
+                x, y = event.x, event.y
+                canvas.create_line(x-2, y-2, x+2, y+2)
+
+    except guio.CloseWindow:
+        pass
 
 guio.run(main)
 ```
