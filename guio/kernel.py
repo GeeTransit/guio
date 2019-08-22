@@ -534,6 +534,7 @@ class TkKernel(Kernel):
                 except StopIteration:
                     pass
                 else:
+                    logger.warn("Async gen didnt close properly: %r", asyncgen)
                     aclose.close()
 
 
