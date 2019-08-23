@@ -14,7 +14,7 @@ from types import coroutine
 
 from curio import __version__ as CURIO_VERSION
 from curio.errors import *
-from curio.kernel import run as curio_run, Kernel
+from curio.kernel import run as curio_run, Kernel as CurioKernel
 from curio.sched import SchedBarrier
 from curio.task import Task
 from curio.traps import _read_wait
@@ -29,10 +29,10 @@ logger = logging.getLogger(__name__)
 CURIO_VERSION = tuple(int(i) for i in CURIO_VERSION.split("."))
 
 
-__all__ = ["TkKernel", "run"]
+__all__ = ["Kernel", "run"]
 
 
-class TkKernel(Kernel):
+class Kernel(CurioKernel):
 
     _tk_events = (
         "<Activate>",
@@ -65,9 +65,9 @@ class TkKernel(Kernel):
     )
 
 
-    @wraps(Kernel.__init__)
+    @wraps(CurioKernel.__init__)
     def __init__(self, *args, **kwargs):
-        Kernel.__init__(self, *args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         self._event_queue = deque()
         self._event_wait = SchedBarrier()
@@ -743,12 +743,19 @@ class TkKernel(Kernel):
                                     raise
                             break
 
-                        else:
+                        try:
                             # Find and run requested trap
                             current._trap_result = traps[trap[0]](*trap[1:])
 
+                        except BaseException:
+                            # If an exception happens here, it puts the task in an
+                            # unrecoverable state. The kernel "crashes" and stops
+                            # any further attempt to use it.
+                            kernel._shutdown_funcs = None
+                            raise
 
-                    # --- Task suspended ---
+
+                    # --- Task suspended / terminated ---
 
                     if current.suspend_func:
                         current.suspend_func()
@@ -798,7 +805,7 @@ class TkKernel(Kernel):
 
                 # If an exception happened, raise it here
                 if isinstance(result, BaseException):
-                    raise result from None
+                    raise result
 
                 # Get coro to run
                 data = (yield result)
