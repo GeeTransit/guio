@@ -77,8 +77,9 @@ class TkKernel(Kernel):
 
         # --- Kernel state ---
 
-        # Current task
-        current = active = None
+        # Current task / state
+        current = None
+        running = False
 
         # Restore kernel state
         event_queue = kernel._event_queue
@@ -157,7 +158,7 @@ class TkKernel(Kernel):
             task._trap_result = val
 
         def suspend(state, cancel_func):
-            nonlocal current
+            nonlocal running
             current.state = state
             current.cancel_func = cancel_func
 
@@ -165,7 +166,7 @@ class TkKernel(Kernel):
                 _unregister_event(*current._last_io)
                 current._last_io = None
 
-            current = None
+            running = None
 
         def new_task(coro):
             task = Task(coro)
@@ -320,10 +321,10 @@ class TkKernel(Kernel):
 
         @blocking
         def _trap_sleep(clock, absolute):
-            nonlocal current
+            nonlocal running
             if clock == 0:
                 reschedule(current)
-                current = None
+                running = False
                 return
 
             if not absolute:
@@ -565,7 +566,7 @@ class TkKernel(Kernel):
             # --- Main loop preparation ---
 
             # Current task
-            nonlocal current, active
+            nonlocal current, running
 
             # Only way to suspend for tkinter callback
             @coroutine
@@ -708,61 +709,62 @@ class TkKernel(Kernel):
                 # --- Running ready tasks ---
 
                 for _ in range(len(ready)):
-                    current = active = ready_popleft()
+                    current = ready_popleft()
                     for a in _activations:
-                        a.running(active)
-                    active.state = "RUNNING"
-                    active.cycles += 1
+                        a.running(current)
+                    current.state = "RUNNING"
+                    current.cycles += 1
+                    running = True
 
                     # Run task until it suspends or terminates
-                    while current:
+                    while running:
 
                         try:
+                            # Send next value
                             trap = current._send(current._trap_result)
 
                         except BaseException as e:
-                            current = None
-
                             # Wake joining tasks
-                            for wtask in active.joining.pop(len(active.joining)):
+                            for wtask in current.joining.pop(len(current.joining)):
                                 reschedule(wtask)
-                            active.terminated = True
-                            active.state = "TERMINATED"
-                            del tasks[active.id]
-                            active.timeout = None
+                            current.terminated = True
+                            current.state = "TERMINATED"
+                            del tasks[current.id]
+                            current.timeout = None
 
-                            # Setting result / exception
+                            # Set task result / exception
                             if isinstance(e, StopIteration):
-                                active.result = e.value
+                                current.result = e.value
                             else:
-                                active.exception = e
-                                if active.report_crash and not isinstance(e, (CancelledError, SystemExit)):
-                                    logger.error("Task Crash: %r", active, exc_info=True)
+                                current.exception = e
+                                if current.report_crash and not isinstance(e, (CancelledError, SystemExit)):
+                                    logger.error("Task Crash: %r", current, exc_info=True)
                                 if not isinstance(e, Exception):
                                     raise
                             break
 
-                        # Find and run requested trap
                         else:
+                            # Find and run requested trap
                             current._trap_result = traps[trap[0]](*trap[1:])
 
 
                     # --- Task suspended ---
 
-                    if active.suspend_func:
-                        active.suspend_func()
-                        active.suspend_func = None
+                    if current.suspend_func:
+                        current.suspend_func()
+                        current.suspend_func = None
 
-                    if active._last_io:
-                        unregister(*active._last_io)
-                        active._last_io = None
+                    if current._last_io:
+                        unregister(*current._last_io)
+                        current._last_io = None
 
                     for a in _activations:
-                        a.suspended(active)
-                        if active.terminated:
-                            a.terminated(active)
+                        a.suspended(current)
+                        if current.terminated:
+                            a.terminated(current)
 
-                    current = active = None
+                    current = None
+                    running = False
 
 
         # --- Outer loop preparation ---
