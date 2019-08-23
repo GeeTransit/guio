@@ -20,6 +20,6 @@ class TaskNotEvent(GuioError):
 
 
 # Raised when the `X` button was pressed
-# Note: This is only raised on the `_wait_event` trap.
+# Note: This is only raised on the `_pop_event` trap.
 class CloseWindow(GuioError):
     pass

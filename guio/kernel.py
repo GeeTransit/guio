@@ -17,7 +17,7 @@ from curio.errors import *
 from curio.kernel import run as curio_run, Kernel
 from curio.sched import SchedBarrier
 from curio.task import Task
-from curio.traps import _read_wait, Traps
+from curio.traps import _read_wait
 
 from .errors import *
 from .event import iseventtask
@@ -26,7 +26,7 @@ from .event import iseventtask
 logger = logging.getLogger(__name__)
 
 
-CURIO_VERSION = (*map(int, CURIO_VERSION.split(".")),)
+CURIO_VERSION = tuple(int(i) for i in CURIO_VERSION.split("."))
 
 
 __all__ = ["TkKernel", "run"]
@@ -71,12 +71,6 @@ class TkKernel(Kernel):
 
         self._event_queue = deque()
         self._event_wait = SchedBarrier()
-
-
-    if CURIO_VERSION < (0, 10):
-        def __exit__(self, ty, val, eb):
-            if self._shutdown_funcs is not None:
-                self.run(shutdown=True)
 
 
     def _run_coro(kernel):
@@ -128,6 +122,8 @@ class TkKernel(Kernel):
                 try:
                     wait_sock.recv(1000)
                 except BlockingIOError:
+                    # This may raise an error as the 1 ms delay in
+                    # tkinter's loop could cause the read to fail. 
                     continue
 
                 while wake_queue:
@@ -158,13 +154,7 @@ class TkKernel(Kernel):
             ready_append(task)
             task.state = "READY"
             task.cancel_func = None
-            if isinstance(val, BaseException):
-                task.next_value = None
-                task.next_exc = val
-            else:
-                task.next_value = val
-                task.next_exc = None
-            # task._trap_result = val
+            task._trap_result = val
 
         def suspend(state, cancel_func):
             nonlocal current
@@ -540,17 +530,11 @@ class TkKernel(Kernel):
 
         # --- Final setup ---
 
-        kernel._traps = traps = {}
-        for trap in Traps:
-            traps[trap.value] = locals()[trap.name]
-        for key, value in locals().items():
-            if key.startswith("_trap_"):
-                traps[key] = value
-        # kernel._traps = traps = {
-        #     key:value
-        #     for key, value in locals().items()
-        #     if key.startswith("_trap_")
-        # }
+        kernel._traps = traps = {
+            key:value
+            for key, value in locals().items()
+            if key.startswith("_trap_")
+        }
 
         if kernel._kernel_task_id is None:
             init_loopback()
@@ -601,13 +585,12 @@ class TkKernel(Kernel):
 
                 if (main_task and main_task.terminated) or (not ready and not main_task):
                     if main_task:
-                        main_task._joined = True
-                        # main_task.joined = True
-                    coro = (yield ((main_task.next_value, main_task.next_exc) if main_task else (None, None)))
-                    # coro = (yield main_task)
+                        main_task.joined = True
+                    coro = (yield main_task)
                     if coro:
                         main_task = new_task(coro)
                         main_task.report_crash = False
+                        main_task.next_event = 0
                     else:
                         main_task = None
                     del coro
@@ -616,6 +599,7 @@ class TkKernel(Kernel):
                 # --- I/O event waiting ---
 
                 try:
+                    # Return immediately
                     events = selector_select(0)
                 except OSError as e:
                     # Windows throws an error if the selector is empty.
@@ -650,7 +634,9 @@ class TkKernel(Kernel):
 
                 # --- Tkinter event waiting ---
 
-                # Ensure a resumation
+                # Ensure a resumation if there are any ready tasks,
+                # possible select calls in the future, or an empty main
+                # task.
                 if ready or selector_getmap() or not main_task:
                     timeout = 0
                     data = "READY"
@@ -677,7 +663,7 @@ class TkKernel(Kernel):
                         reschedule(task)
 
 
-                # --- Run event clearer (garbage collection :P) ---
+                # --- Run event clearer (event garbage collection :P) ---
 
                 event_tasks = [task for task in tasks.values() if iseventtask(task)]
                 if event_tasks:
@@ -732,11 +718,7 @@ class TkKernel(Kernel):
                     while current:
 
                         try:
-                            if current.next_exc:
-                                trap = current._throw(current.next_exc)
-                            else:
-                                trap = current._send(current.next_value)
-                            # trap = current._send(current._trap_result)
+                            trap = current._send(current._trap_result)
 
                         except BaseException as e:
                             current = None
@@ -751,13 +733,9 @@ class TkKernel(Kernel):
 
                             # Setting result / exception
                             if isinstance(e, StopIteration):
-                                active.next_value = e.value
-                                active.next_exc = None
-                                # active.result = e.value
+                                active.result = e.value
                             else:
-                                active.next_value = None
-                                active.next_exc = e
-                                # active.exception = 
+                                active.exception = e
                                 if active.report_crash and not isinstance(e, (CancelledError, SystemExit)):
                                     logger.error("Task Crash: %r", active, exc_info=True)
                                 if not isinstance(e, Exception):
@@ -766,14 +744,7 @@ class TkKernel(Kernel):
 
                         # Find and run requested trap
                         else:
-                            trap_result = traps[trap[0]](*trap[1:])
-                            if isinstance(trap_result, BaseException):
-                                active.next_value = None
-                                active.next_exc = trap_result
-                            else:
-                                active.next_value = trap_result
-                                active.next_exc = None
-                            # current._trap_result = traps[trap[0]](*trap[1:])
+                            current._trap_result = traps[trap[0]](*trap[1:])
 
 
                     # --- Task suspended ---
@@ -884,4 +855,4 @@ def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
 if __name__ == "__main__":
     async def test():
         return 0
-    print(run(test))
+    run(test)
