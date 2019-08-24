@@ -220,12 +220,15 @@ def attempt_once(grid_copy):
 
 async def attempt_finish(grid):
     same = 0
-    while not grid.full and same < 5:
+    while not grid.full:
         await curio.schedule()
         grid_attempt = attempt_once(grid.copy())
         grid.grid = grid_attempt.grid
         if grid_attempt == grid:
-            same += 1
+            print(grid_attempt, grid)
+            break
+        else:
+            same = 0
     return grid
 
 async def program(
