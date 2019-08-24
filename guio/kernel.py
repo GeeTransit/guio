@@ -21,6 +21,7 @@ from curio.traps import _read_wait
 
 from .errors import *
 from .event import iseventtask
+from .utilities import destroying
 
 
 logger = logging.getLogger(__name__)
@@ -502,16 +503,6 @@ class Kernel(CurioKernel):
 
 
         # --- Outer loop helper functions ---
-
-        @contextmanager
-        def destroying(widget):
-            try:
-                yield widget
-            except tkinter.TclError:
-                logger.info("Widget exception: %r", widget, exc_info=True)
-                return True
-            finally:
-                destroy(widget)
 
         @contextmanager
         def aclosing(asyncgen):
