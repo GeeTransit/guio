@@ -5,7 +5,7 @@ import tkinter
 
 from collections import deque
 from contextlib import contextmanager, ExitStack
-from inspect import getcoroutinestate, CORO_CLOSED, CORO_RUNNING
+from inspect import getgeneratorstate, GEN_CLOSED, GEN_RUNNING
 from functools import wraps
 from selectors import EVENT_READ, EVENT_WRITE
 from socket import socketpair
@@ -432,9 +432,9 @@ class Kernel(CurioKernel):
         # --- Tkinter loop helpers ---
 
         # Send if the loop is suspended (True if sent, False otherwise)
-        _unsafe_states = frozenset({CORO_CLOSED, CORO_RUNNING})
+        _unsafe_states = frozenset({GEN_CLOSED, GEN_RUNNING})
         def safe_send(data, *, retry=True, _unsafe_states=_unsafe_states):
-            state = getcoroutinestate(loop)
+            state = getgeneratorstate(loop)
             if state in _unsafe_states:
                 if retry:
                     frame.after(1, lambda: safe_send(data, retry=True))
@@ -777,7 +777,7 @@ class Kernel(CurioKernel):
                     frame.wait_window()
 
                 # Check for exceptions
-                if getcoroutinestate(loop) != CORO_CLOSED:
+                if getcoroutinestate(loop) != GEN_CLOSED:
                     loop.close()
                     raise RuntimeError("Frame closed before main task finished") from result
 

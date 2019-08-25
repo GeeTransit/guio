@@ -4,27 +4,10 @@ from tkinter import TclError, Tk
 from curio.thread import spawn_thread, AWAIT
 
 
-__all__ = [
-    "AGEN_CREATED", "AGEN_RUNNING", "AGEN_SUSPENDED", "AGEN_CLOSED",
-    "getasyncgenstate", "run_in_main", "dialog",
+__all__ = [=
+    "run_in_main", "dialog",
     "exists", "destroy", "destroying",
 ]
-
-
-AGEN_CREATED = "AGEN_CREATED"
-AGEN_RUNNING = "AGEN_RUNNING"
-AGEN_SUSPENDED = "AGEN_SUSPENDED"
-AGEN_CLOSED = "AGEN_CLOSED"
-
-
-def getasyncgenstate(asyncgen):
-    if asyncgen.ag_running:
-        return AGEN_RUNNING
-    if asyncgen.ag_frame is None:
-        return AGEN_CLOSED
-    if asyncgen.ag_frame.f_lasti == -1:
-        return AGEN_CREATED
-    return AGEN_SUSPENDED
 
 
 async def _run_in_main_helper(func, args, kwargs):
