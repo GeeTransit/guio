@@ -819,7 +819,7 @@ def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
     use its run() method instead.
     """
 
-    kernel = TkKernel(**kernel_kwargs)
+    kernel = Kernel(**kernel_kwargs)
 
     # Check if a monitor has been requested
     if with_monitor or 'CURIOMONITOR' in os.environ:
