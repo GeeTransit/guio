@@ -1,3 +1,5 @@
+import logging
+
 from contextlib import contextmanager
 from tkinter import TclError, Tk
 
@@ -8,6 +10,9 @@ __all__ = [
     "run_in_main", "dialog",
     "exists", "destroy", "destroying",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 async def _run_in_main_helper(func, args, kwargs):
@@ -39,7 +44,7 @@ def destroy(widget):
     try:
         widget.destroy()
     except TclError:
-        pass
+        logger.warn("Widget destruction error: %r", widget, exc_info=True)
 
 
 @contextmanager
