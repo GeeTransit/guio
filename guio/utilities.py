@@ -6,7 +6,7 @@ from curio.thread import spawn_thread, AWAIT
 
 __all__ = [
     "AGEN_CREATED", "AGEN_RUNNING", "AGEN_SUSPENDED", "AGEN_CLOSED",
-    "getasyncgenstate", "run_in_main", "dialog"
+    "getasyncgenstate", "run_in_main", "dialog",
     "exists", "destroy", "destroying",
 ]
 
