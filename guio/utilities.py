@@ -43,8 +43,16 @@ def exists(widget):
 def destroy(widget):
     try:
         widget.destroy()
-    except TclError:
-        logger.warn("Widget destruction error: %r", widget, exc_info=True)
+    except TclError as e:
+        if "application has been destroyed" not in str(e):
+            logger.warn("Widget destruction error: %r", widget, exc_info=True)
+    if hasattr(widget, "quit"):
+        # We have to close the Tcl interpreter in its thread of creation
+        # or cleanup will be done on the main thread. Calling `.quit()`
+        # cleans up the interpreter on the same thread, preventing a
+        # `Tcl_AsyncDelete` error from hanging the whole process.
+        # https://stackoverflow.com/a/27077347/
+        widget.quit()
 
 
 @contextmanager
