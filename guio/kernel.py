@@ -129,7 +129,7 @@ class Kernel(CurioKernel):
                 except BlockingIOError:
                     # This may raise an error as the 1 ms delay in
                     # tkinter's loop could cause the read to fail. 
-                    continue
+                    pass
 
                 while wake_queue:
                     task, future = wake_queue_popleft()
@@ -431,16 +431,16 @@ class Kernel(CurioKernel):
 
         # --- Tkinter loop helpers ---
 
-        # Send if the cycle is suspended (True if sent, False otherwise)
+        # Send if the loop is suspended (True if sent, False otherwise)
         _unsafe_states = frozenset({CORO_CLOSED, CORO_RUNNING})
         def safe_send(data, *, retry=True, _unsafe_states=_unsafe_states):
-            state = getcoroutinestate(cycle)
+            state = getcoroutinestate(loop)
             if state in _unsafe_states:
                 if retry:
                     frame.after(1, lambda: safe_send(data, retry=True))
                 return False
             else:
-                send(cycle, data)
+                send(loop, data)
                 return True
 
         # Decorator to return "break" for tkinter callbacks
@@ -489,24 +489,6 @@ class Kernel(CurioKernel):
             _last_close = now
 
 
-        # --- Outer loop helper functions ---
-
-        @contextmanager
-        def aclosing(asyncgen):
-            try:
-                yield asyncgen
-            finally:
-                aclose = asyncgen.aclose()
-                try:
-                    for _ in range(100):
-                        aclose.send(None)
-                except StopIteration:
-                    pass
-                else:
-                    logger.warn("Async gen didnt close properly: %r", asyncgen)
-                    aclose.close()
-
-
         # --- Final setup ---
 
         kernel._traps = traps = {
@@ -537,8 +519,11 @@ class Kernel(CurioKernel):
 
 
         # --- Tkinter loop (run using tkinter's mainloop) ---
+        # Note: A new inner loop is created for each "iteration" of the
+        # kernel loop. Shared state is stored outside the inner loop to
+        # reduce delays.
 
-        async def _inner_loop():
+        def _inner_loop(coro):
 
 
             # --- Main loop preparation ---
@@ -546,13 +531,14 @@ class Kernel(CurioKernel):
             # Current task
             nonlocal current, running
 
-            # Only way to suspend for tkinter callback
-            @coroutine
-            def _suspend_cycle():
-                return (yield)
-
             # Main task
-            main_task = None
+            if coro:
+                main_task = new_task(coro)
+                main_task.report_crash = False
+                main_task.next_event = 0
+            else:
+                main_task = None
+            del coro
 
 
             # --- Main loop ---
@@ -565,14 +551,7 @@ class Kernel(CurioKernel):
                 if (main_task and main_task.terminated) or (not ready and not main_task):
                     if main_task:
                         main_task.joined = True
-                    coro = (yield main_task)
-                    if coro:
-                        main_task = new_task(coro)
-                        main_task.report_crash = False
-                        main_task.next_event = 0
-                    else:
-                        main_task = None
-                    del coro
+                    return main_task
 
 
                 # --- I/O event waiting ---
@@ -630,7 +609,7 @@ class Kernel(CurioKernel):
 
                 # Wait for callback
                 try:
-                    info = await _suspend_cycle()
+                    info = (yield)
 
                 # Cancel after callback
                 finally:
@@ -760,7 +739,7 @@ class Kernel(CurioKernel):
 
         result = None
         toplevel = frame = None
-        loop = cycle = None
+        loop = None
 
         # Wrap toplevel and loop with closing managers
         with ExitStack() as stack:
@@ -769,16 +748,10 @@ class Kernel(CurioKernel):
             toplevel = enter(destroying(tkinter.Tk()))
             kernel._call_at_shutdown(lambda: destroy(toplevel))
 
-            loop = enter(aclosing(_inner_loop()))
             enter(bind(toplevel, send_tk_event, kernel._tk_events))
             enter(bind(toplevel, send_other_event, kernel._other_events))
             enter(bind(toplevel, send_destroy_event, ("<Destroy>",)))
             enter(protocol(toplevel, close_window))
-
-            cycle = wrap_coro(loop.asend(None))
-            with destroying(tkinter.Frame(toplevel)) as frame:
-                send(cycle, None)
-                frame.wait_window()
 
 
             # --- Outer loop ---
@@ -791,28 +764,25 @@ class Kernel(CurioKernel):
 
                 # Get coro to run
                 data = (yield result)
-                cycle = wrap_coro(loop.asend(data))
+                loop = _inner_loop(data)
                 del data
 
                 # Run until frame is destroyed
                 # Note: `wait_window` will spawn in tkinter's event loop
                 # but will end when the widget is destroyed. `frame` will
                 # be destroyed when an exception happens in sending a value
-                # to the cycle.
+                # to the loop.
                 with destroying(tkinter.Frame(toplevel)) as frame:
-                    send(cycle, None)
+                    send(loop, None)
                     frame.wait_window()
 
                 # Check for exceptions
-                if getcoroutinestate(cycle) != CORO_CLOSED:
-                    cycle.close()
+                if getcoroutinestate(loop) != CORO_CLOSED:
+                    loop.close()
                     raise RuntimeError("Frame closed before main task finished") from result
 
                 if not exists(toplevel):
                     raise RuntimeError("Toplevel was destroyed") from result
-
-                if getasyncgenstate(loop) == "AGEN_CLOSED":
-                    raise RuntimeError("Loop was closed") from result
 
 
 @wraps(curio_run)
