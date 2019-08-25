@@ -46,7 +46,7 @@ def destroy(widget):
     except TclError as e:
         if "application has been destroyed" not in str(e):
             logger.warn("Widget destruction error: %r", widget, exc_info=True)
-    if hasattr(widget, "quit"):
+    if isinstance(widget, tkinter.Misc) and not isinstance(widget, tkinter.Widget):
         # We have to close the Tcl interpreter in its thread of creation
         # or cleanup will be done on the main thread. Calling `.quit()`
         # cleans up the interpreter on the same thread, preventing a
