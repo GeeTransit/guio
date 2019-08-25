@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from tkinter import Tk
+from tkinter import TclError, Tk
 
 from curio.thread import spawn_thread, AWAIT
 
@@ -40,7 +40,7 @@ async def run_in_main(func_, *args, **kwargs):
 # Use for dialogs without blocking the coroutine
 async def dialog(func_, *args, **kwargs):
     async with spawn_thread():
-        with destroying(tkinter.Tk()) as root:
+        with destroying(Tk()) as root:
             root.withdraw()
             return func_(*args, **kwargs)
 
@@ -48,13 +48,13 @@ async def dialog(func_, *args, **kwargs):
 def exists(widget):
     try:
         return bool(widget.winfo_exists())
-    except tkinter.TclError:
+    except TclError:
         return False
 
 def destroy(widget):
     try:
         widget.destroy()
-    except tkinter.TclError:
+    except TclError:
         pass
 
 
