@@ -82,6 +82,9 @@ class Kernel(CurioKernel):
         current = None
         running = False
 
+        # Store last window close
+        _last_close = None
+
         # Restore kernel state
         event_queue = kernel._event_queue
         event_wait = kernel._event_wait
@@ -476,9 +479,14 @@ class Kernel(CurioKernel):
 
         @callback
         def close_window():
+            nonlocal _last_close
             event_queue_append(CloseWindow("X was pressed"))
+            now = monotonic()
+            if _last_close and _last_close + 0.5 > now:
+                safe_send(RuntimeError("Kernel was force closed"))
             if event_wait:
                 safe_send("EVENT_WAKE")
+            _last_close = now
 
 
         # --- Outer loop helper functions ---
@@ -628,6 +636,10 @@ class Kernel(CurioKernel):
                 finally:
                     if timeout is not None:
                         frame.after_cancel(id_)
+
+                # Handle exceptions (similar to `curio.traps._kernel_trap`)
+                if isinstance(info, BaseException):
+                    raise info
 
                 if info == "EVENT_WAKE":
                     for task in event_wait.pop(len(event_wait)):

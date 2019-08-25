@@ -51,6 +51,7 @@ def exists(widget):
     except TclError:
         return False
 
+
 def destroy(widget):
     try:
         widget.destroy()
