@@ -4,7 +4,7 @@ from tkinter import TclError, Tk
 from curio.thread import spawn_thread, AWAIT
 
 
-__all__ = [=
+__all__ = [
     "run_in_main", "dialog",
     "exists", "destroy", "destroying",
 ]
