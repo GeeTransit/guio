@@ -21,16 +21,16 @@ from curio.traps import _read_wait
 
 from .errors import *
 from .event import iseventtask
-from .utilities import destroying
+from .utilities import *
 
 
-logger = logging.getLogger(__name__)
+__all__ = ["Kernel", "run"]
 
 
 CURIO_VERSION = tuple(int(i) for i in CURIO_VERSION.split("."))
 
 
-__all__ = ["Kernel", "run"]
+logger = logging.getLogger(__name__)
 
 
 class Kernel(CurioKernel):
@@ -390,27 +390,6 @@ class Kernel(CurioKernel):
 
         # --- Tkinter helpers ---
 
-        def exists(widget):
-            try:
-                return bool(widget.winfo_exists())
-            except tkinter.TclError:
-                return False
-
-        def destroy(widget):
-            try:
-                widget.destroy()
-            except tkinter.TclError:
-                pass
-
-        def getasyncgenstate(asyncgen):
-            if asyncgen.ag_running:
-                return "AGEN_RUNNING"
-            if asyncgen.ag_frame is None:
-                return "AGEN_CLOSED"
-            if asyncgen.ag_frame.f_lasti == -1:
-                return "AGEN_CREATED"
-            return "AGEN_SUSPENDED"
-
         async def wrap_coro(coro):
             return await coro
 
@@ -631,7 +610,7 @@ class Kernel(CurioKernel):
                 # task.
                 if ready or selector_getmap() or not main_task:
                     timeout = 0
-                    data = "READY"
+                    data = "NON_BLOCKING"
                 else:
                     now = monotonic()
                     timeout = sleepq.next_deadline(now)
