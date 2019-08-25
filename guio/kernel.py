@@ -10,7 +10,6 @@ from functools import wraps
 from selectors import EVENT_READ, EVENT_WRITE
 from socket import socketpair
 from time import monotonic
-from types import coroutine
 
 from curio import __version__ as CURIO_VERSION
 from curio.errors import *
@@ -777,7 +776,7 @@ class Kernel(CurioKernel):
                     frame.wait_window()
 
                 # Check for exceptions
-                if getcoroutinestate(loop) != GEN_CLOSED:
+                if getgeneratorstate(loop) != GEN_CLOSED:
                     loop.close()
                     raise RuntimeError("Frame closed before main task finished") from result
 

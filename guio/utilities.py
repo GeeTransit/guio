@@ -25,7 +25,7 @@ async def dialog(func_, *args, **kwargs):
     async with spawn_thread():
         with destroying(Tk()) as root:
             root.withdraw()
-            return func_(*args, **kwargs)
+            return func_(root, *args, **kwargs)
 
 
 def exists(widget):
