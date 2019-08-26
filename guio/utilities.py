@@ -1,7 +1,7 @@
 import logging
 
 from contextlib import contextmanager
-from tkinter import TclError, Tk
+from tkinter import Misc, TclError, Tk, Widget
 
 from curio.thread import spawn_thread, AWAIT
 
@@ -46,7 +46,7 @@ def destroy(widget):
     except TclError as e:
         if "application has been destroyed" not in str(e):
             logger.warn("Widget destruction error: %r", widget, exc_info=True)
-    if isinstance(widget, tkinter.Misc) and not isinstance(widget, tkinter.Widget):
+    if isinstance(widget, Misc) and not isinstance(widget, Widget):
         # We have to close the Tcl interpreter in its thread of creation
         # or cleanup will be done on the main thread. Calling `.quit()`
         # cleans up the interpreter on the same thread, preventing a
