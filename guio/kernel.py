@@ -747,7 +747,7 @@ class Kernel(CurioKernel):
             enter = stack.enter_context
 
             kernel._toplevel = toplevel = tkinter.Tk()
-            enter(destroying(toplevel)
+            enter(destroying(toplevel))
 
             enter(bind(toplevel, send_tk_event, kernel._tk_events))
             enter(bind(toplevel, send_other_event, kernel._other_events))
