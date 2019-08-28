@@ -2,15 +2,13 @@ Guio - Curio-Tkinter Compatible Kernel
 ======================================
 Guio is a small library that provides a Curio compatible kernel with Tkinter support. This means you can continue to use Curio but have a GUI at the same time!
 
-Here's a small example:
+Here's a small example using just Guio:
 
 ```python
 import tkinter
 import guio
 
 async def main():
-    await guio.set_current_event()
-
     toplevel = await guio.current_toplevel()
     canvas = tkinter.Canvas(toplevel, highlightthickness=0)
     canvas.pack(expand=True, fill=tkinter.BOTH)
@@ -33,7 +31,7 @@ To fully appreciate asynchronous Python, check out [Curio](https://github.com/da
 
 About
 -----
-Guio was created by George Zhang (@geetransit).
+Guio was created by [George Zhang](@geetransit) after trying to get rid of them tkinter callbacks. Now tkinter, threads, and asynchronous code can work together for the better of humanity (I hope).
 
 All contributions are welcome!
 
