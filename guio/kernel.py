@@ -398,10 +398,10 @@ class Kernel(CurioKernel):
             except BaseException as e:
                 nonlocal result
                 destroy(frame)
-                if isinstance(e, StopIteration) and e.value is not None:
-                    result = e.value
-                elif e.value is not None:
+                if not isinstance(e, StopIteration):
                     result = e
+                elif e.value is not None:
+                    result = e.value
 
         @contextmanager
         def bind(widget, func, events):
@@ -623,29 +623,26 @@ class Kernel(CurioKernel):
 
                 # --- Run event clearer (event garbage collection :P) ---
 
-                event_task_offsets = (
-                    task.next_event
-                    for task in tasks.values()
-                    if iseventtask(task)
-                )
-                min_offset = min(event_task_offsets, default=None)
+                event_tasks = {task for task in tasks.values() if iseventtask(task)}
 
                 # Check that there are event tasks and offset is non zero
-                if min_offset:
-                    for _ in range(offset):
-                        event_queue.popleft()
-                    for task in event_tasks:
-                        task.next_event -= offset
+                if event_tasks:
+                    min_offset = min(task.next_event for task in event_tasks)
+                    if min_offset:
+                        for _ in range(min_offset):
+                            event_queue.popleft()
+                        for task in event_tasks:
+                            task.next_event -= min_offset
 
                 # Clear the queue if there aren't any tasks to collect events
                 # Note: This will leave at most 50 events on the queue.
-                elif offset is None and len(event_queue) > 50:
+                elif len(event_queue) > 50:
 
                     # Leave 25 so that this doesn't run everytime a new event
                     # is added and the length pops over 50.
-                    offset = len(event_queue) - 25
-                    logger.info("Clearing %s events from event queue", offset)
-                    for _ in range(offset):
+                    event_offset = len(event_queue) - 25
+                    logger.info("Clearing %s events from event queue", event_offset)
+                    for _ in range(event_offset):
                         event_queue.popleft()
 
 

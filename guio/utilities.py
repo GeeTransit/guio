@@ -3,7 +3,6 @@ import logging
 from contextlib import contextmanager
 from tkinter import Misc, TclError, Tk, Widget
 
-from curio.errors import TaskCancelled
 from curio.thread import spawn_thread, AWAIT
 
 from .event import current_toplevel
@@ -28,21 +27,31 @@ async def run_in_main(func_, *args, **kwargs):
 
 
 def _dialog_helper(func, args, kwargs, x, y, close):
-    with destroying(Tk()) as root:
+    def check_close():
+        if not close[0]:
+            root.after(500, check_close)
+        else:
+            destroy(root)
+
+    root = Tk()
+    try:
         root.withdraw()
         root.lift()
         root.attributes("-topmost", True)
         root.focus_set()
         root.title("Dialog")
         root.geometry(f"0x0+{x}+{y}")
-        callback = (
-            lambda:
-            root.after(250, callback)
-            if not close[0]
-            else destroy(root)
-        )
-        root.after(500, callback)
+
+        check_close()
         return func(root, *args, **kwargs)
+
+    finally:
+        destroy(root)
+        root.quit()
+        # We have to explicitly dereference root here or tkinter throws
+        # a `Tcl_AsyncDelete` exception that hangs the whole process.
+        # Yeah, I don't know either.
+        del root
 
 
 # Use for dialogs without blocking the coroutine
@@ -51,7 +60,8 @@ async def dialog(func_, *args, **kwargs):
     geometry = toplevel.geometry()
     _, x, y = geometry.split("+")  # "WxH+X+Y".split("+") == ["WxH", "X", "Y"]
     close = [False]
-    thread = await spawn_thread(_dialog_helper, func_, args, kwargs, x, y, close)
+    args = (func_, args, kwargs, x, y, close)
+    thread = await spawn_thread(_dialog_helper, *args)
     try:
         return await thread.join()
     finally:
