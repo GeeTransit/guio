@@ -31,7 +31,7 @@ To fully appreciate asynchronous Python, check out [Curio](https://github.com/da
 
 About
 -----
-Guio was created by [George Zhang](@geetransit) after trying to get rid of them tkinter callbacks. Now tkinter, threads, and asynchronous code can work together for the better of humanity (I hope).
+Guio was created by [George Zhang](https://github.com/GeeTransit "@GeeTransit") after trying to get rid of them tkinter callbacks. Now tkinter, threads, and asynchronous code can work together for the better of humanity (I hope).
 
 All contributions are welcome!
 
