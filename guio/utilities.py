@@ -5,7 +5,7 @@ from tkinter import Misc, TclError, Tk, Widget
 
 from curio.thread import spawn_thread, AWAIT
 
-from guio.event import current_toplevel
+from .event import current_toplevel
 
 __all__ = [
     "run_in_main", "dialog",
@@ -31,8 +31,9 @@ def _dialog_helper(func, args, kwargs, x, y):
         root.withdraw()
         root.lift()
         root.attributes("-topmost", True)
-        root.focus_force()
-        root.geometry(f"1x1+{x}+{y}")
+        root.focus_set()
+        root.title("Dialog")
+        root.geometry(f"0x0+{x}+{y}")
         return func(root, *args, **kwargs)
 
 
@@ -40,9 +41,9 @@ def _dialog_helper(func, args, kwargs, x, y):
 async def dialog(func_, *args, **kwargs):
     toplevel = await current_toplevel()
     geometry = toplevel.geometry()
-    _, x, y = geometry.split("+")
     thread = await spawn_thread(_dialog_helper, func_, args, kwargs, x, y)
     return await thread.join()
+    _, x, y = geometry.split("+")  # "WxH+X+Y".split("+") == ["WxH", "X", "Y"]
 
 
 def exists(widget):

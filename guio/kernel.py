@@ -135,14 +135,12 @@ class Kernel(CurioKernel):
                     if future and task.future is not future:
                         continue
                     task.future = None
-                    task.state = 'READY'
-                    task.cancel_func = None
-                    ready_append(task)
+                    reschedule(task)
 
         def wake(task=None, future=None):
             if task:
                 wake_queue.append((task, future))
-            kernel._notify_sock.send(b'\x00')
+            kernel._notify_sock.send(b"\x00")
 
         def init_loopback():
             kernel._notify_sock, kernel._wait_sock = socketpair()
@@ -177,10 +175,7 @@ class Kernel(CurioKernel):
             reschedule(task)
             return task
 
-        def cancel_task(task, *, exc=TaskCancelled, val=None):
-            if not isinstance(exc, BaseException):
-                exc = exc(exc.__name__ if val is None else val)
-
+        def cancel_task(task, exc):
             if task.allow_cancel and task.cancel_func:
                 task.cancel_func()
                 reschedule(task, exc)
@@ -291,10 +286,10 @@ class Kernel(CurioKernel):
                 event.set()
 
             suspend(
-                'FUTURE_WAIT',
+                "FUTURE_WAIT",
                 lambda task=current: (
                     future.cancel(),
-                    setattr(task, 'future', None),
+                    setattr(task, "future", None),
                 ),
             )
 
@@ -306,9 +301,11 @@ class Kernel(CurioKernel):
         def _trap_cancel_task(task, exc=TaskCancelled, val=None):
             if task.cancelled:
                 return
+            if not isinstance(exc, BaseException):
+                exc = exc(exc.__name__ if val is None else val)
             task.cancelled = True
             task.timeout = None
-            cancel_task(task, exc=exc, val=val)
+            cancel_task(task, exc)
 
         @blocking
         def _trap_sched_wait(sched, state):
@@ -324,8 +321,8 @@ class Kernel(CurioKernel):
 
         @blocking
         def _trap_sleep(clock, absolute):
-            nonlocal running
             if clock == 0:
+                nonlocal running
                 reschedule(current)
                 running = False
                 return
@@ -401,11 +398,9 @@ class Kernel(CurioKernel):
             except BaseException as e:
                 nonlocal result
                 destroy(frame)
-                if isinstance(e, StopAsyncIteration):
-                    pass
-                elif isinstance(e, StopIteration):
+                if isinstance(e, StopIteration) and e.value is not None:
                     result = e.value
-                else:
+                elif e.value is not None:
                     result = e
 
         @contextmanager
@@ -437,6 +432,8 @@ class Kernel(CurioKernel):
             if state in _unsafe_states:
                 if retry:
                     frame.after(1, lambda: safe_send(data, retry=True))
+                else:
+                    logger.info("Couldn't send data: %r", data)
                 return False
             else:
                 send(loop, data)
@@ -626,18 +623,23 @@ class Kernel(CurioKernel):
 
                 # --- Run event clearer (event garbage collection :P) ---
 
-                event_tasks = [task for task in tasks.values() if iseventtask(task)]
-                if event_tasks:
-                    offset = min(task.next_event for task in event_tasks)
-                    if offset:
-                        for _ in range(offset):
-                            event_queue.popleft()
-                        for task in event_tasks:
-                            task.next_event -= offset
+                event_task_offsets = (
+                    task.next_event
+                    for task in tasks.values()
+                    if iseventtask(task)
+                )
+                min_offset = min(event_task_offsets, default=None)
+
+                # Check that there are event tasks and offset is non zero
+                if min_offset:
+                    for _ in range(offset):
+                        event_queue.popleft()
+                    for task in event_tasks:
+                        task.next_event -= offset
 
                 # Clear the queue if there aren't any tasks to collect events
                 # Note: This will leave at most 50 events on the queue.
-                elif len(event_queue) > 50:
+                elif offset is None and len(event_queue) > 50:
 
                     # Leave 25 so that this doesn't run everytime a new event
                     # is added and the length pops over 50.
@@ -744,8 +746,8 @@ class Kernel(CurioKernel):
         with ExitStack() as stack:
             enter = stack.enter_context
 
-            toplevel = enter(destroying(tkinter.Tk()))
-            kernel._call_at_shutdown(lambda: destroy(toplevel))
+            kernel._toplevel = toplevel = tkinter.Tk()
+            enter(destroying(toplevel)
 
             enter(bind(toplevel, send_tk_event, kernel._tk_events))
             enter(bind(toplevel, send_other_event, kernel._other_events))
@@ -803,7 +805,7 @@ def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
     kernel = Kernel(**kernel_kwargs)
 
     # Check if a monitor has been requested
-    if with_monitor or 'CURIOMONITOR' in os.environ:
+    if with_monitor or "CURIOMONITOR" in os.environ:
         from .monitor import Monitor
         m = Monitor(kernel)
         kernel._call_at_shutdown(m.close)
