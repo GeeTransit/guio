@@ -81,7 +81,16 @@ class Kernel(CurioKernel):
         current = None
         running = False
 
-        # Store last window close
+        # Main loop
+        loop = None
+
+        # Toplevel and frame (tkinter loop)
+        toplevel = frame = None
+
+        # Store result / exception of main loop
+        result = None
+
+        # Store last window close time
         _last_close = None
 
         # Restore kernel state
@@ -206,9 +215,9 @@ class Kernel(CurioKernel):
                 mask = key.events
                 rtask, wtask = key.data
                 if event == EVENT_READ and rtask:
-                    raise ReadResourceBusy("Multiple tasks can't wait to read on the same file descriptor %r" % fileobj)
+                    raise ReadResourceBusy(f"Multiple tasks can't wait to read on the same file descriptor {fileobj!r}")
                 if event == EVENT_WRITE and wtask:
-                    raise WriteResourceBusy("Multiple tasks can't wait to write on the same file descriptor %r" % fileobj)
+                    raise WriteResourceBusy(f"Multiple tasks can't wait to write on the same file descriptor {fileobj!r}")
 
                 selector_modify(
                     fileobj, mask | event,
@@ -285,13 +294,12 @@ class Kernel(CurioKernel):
             if event:
                 event.set()
 
-            suspend(
-                "FUTURE_WAIT",
-                lambda task=current: (
-                    future.cancel(),
-                    setattr(task, "future", None),
-                ),
+            _cancel = (
+                lambda task=current:
+                (future.cancel(), setattr(task, "future", None))
             )
+
+            suspend("FUTURE_WAIT", _cancel)
 
         def _trap_spawn(coro):
             task = new_task(coro)
@@ -321,8 +329,8 @@ class Kernel(CurioKernel):
 
         @blocking
         def _trap_sleep(clock, absolute):
+            nonlocal running
             if clock == 0:
-                nonlocal running
                 reschedule(current)
                 running = False
                 return
@@ -331,13 +339,15 @@ class Kernel(CurioKernel):
                 clock += monotonic()
             set_timeout(clock, "sleep")
 
-            suspend(
-                "TIME_SLEEP",
-                lambda task=current: (
+            _cancel = (
+                lambda task=current:
+                (
                     sleepq.cancel((task.id, "sleep"), task.sleep),
                     setattr(task, "sleep", None),
-                ),
+                )
             )
+
+            suspend("TIME_SLEEP", _cancel)
 
         def _trap_set_timeout(timeout):
             old_timeout = current.timeout
@@ -501,7 +511,7 @@ class Kernel(CurioKernel):
             del t
 
         _activations = [
-            act() if (isinstance(act, type) and issubclass(act, Activation)) else act
+            (act() if isinstance(act, type) and issubclass(act, Activation) else act)
             for act in kernel._activations
         ]
         kernel._activations = _activations
@@ -527,7 +537,7 @@ class Kernel(CurioKernel):
             # Current task
             nonlocal current, running
 
-            # Main task
+            # Setup main task
             if coro:
                 main_task = new_task(coro)
                 main_task.report_crash = False
@@ -542,7 +552,7 @@ class Kernel(CurioKernel):
             while True:
 
 
-                # --- Get new work to run ---
+                # --- Check if main task completed ---
 
                 if (main_task and main_task.terminated) or (not ready and not main_task):
                     if main_task:
@@ -662,7 +672,7 @@ class Kernel(CurioKernel):
                     if sleep_type == "sleep":
                         reschedule(task, now)
                     else:
-                        cancel_task(task, exc=TaskTimeout(now))
+                        cancel_task(task, TaskTimeout(now))
 
 
                 # --- Running ready tasks ---
@@ -734,10 +744,6 @@ class Kernel(CurioKernel):
 
 
         # --- Outer loop preparation ---
-
-        result = None
-        toplevel = frame = None
-        loop = None
 
         # Wrap toplevel and loop with closing managers
         with ExitStack() as stack:
