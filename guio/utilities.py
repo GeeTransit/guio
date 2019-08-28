@@ -3,6 +3,7 @@ import logging
 from contextlib import contextmanager
 from tkinter import Misc, TclError, Tk, Widget
 
+from curio.errors import TaskCancelled
 from curio.thread import spawn_thread, AWAIT
 
 from .event import current_toplevel
@@ -26,7 +27,7 @@ async def run_in_main(func_, *args, **kwargs):
         return AWAIT(_run_in_main_helper(func_, args, kwargs))
 
 
-def _dialog_helper(func, args, kwargs, x, y):
+def _dialog_helper(func, args, kwargs, x, y, close):
     with destroying(Tk()) as root:
         root.withdraw()
         root.lift()
@@ -34,6 +35,13 @@ def _dialog_helper(func, args, kwargs, x, y):
         root.focus_set()
         root.title("Dialog")
         root.geometry(f"0x0+{x}+{y}")
+        callback = (
+            lambda:
+            root.after(250, callback)
+            if not close[0]
+            else destroy(root)
+        )
+        root.after(500, callback)
         return func(root, *args, **kwargs)
 
 
@@ -41,9 +49,13 @@ def _dialog_helper(func, args, kwargs, x, y):
 async def dialog(func_, *args, **kwargs):
     toplevel = await current_toplevel()
     geometry = toplevel.geometry()
-    thread = await spawn_thread(_dialog_helper, func_, args, kwargs, x, y)
-    return await thread.join()
     _, x, y = geometry.split("+")  # "WxH+X+Y".split("+") == ["WxH", "X", "Y"]
+    close = [False]
+    thread = await spawn_thread(_dialog_helper, func_, args, kwargs, x, y, close)
+    try:
+        return await thread.join()
+    finally:
+        close[0] = True
 
 
 def exists(widget):
