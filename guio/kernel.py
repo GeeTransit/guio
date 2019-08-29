@@ -601,13 +601,18 @@ class Kernel(CurioKernel):
                 # Ensure a resumation if there are any ready tasks,
                 # possible select calls in the future, or an empty main
                 # task.
-                if ready or selector_getmap() or not main_task:
+                if ready or not main_task:
                     timeout = 0
-                    data = "NON_BLOCKING"
+                    data = "READY"
                 else:
                     now = monotonic()
-                    timeout = sleepq.next_deadline(now)
-                    data = "SLEEP_WAKE"
+                    next_deadline = sleepq.next_deadline(now)
+                    if next_deadline and next_deadline > 0.1 and selector_getmap():
+                        timeout = 0.1
+                        data = "SELECT"
+                    else:
+                        timeout = next_deadline
+                        data = "SLEEP_WAKE"
 
                 # Set timeout if required
                 if timeout is not None:
