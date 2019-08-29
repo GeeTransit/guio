@@ -598,21 +598,24 @@ class Kernel(CurioKernel):
 
                 # --- Tkinter event waiting ---
 
-                # Ensure a resumation if there are any ready tasks,
-                # possible select calls in the future, or an empty main
-                # task.
                 if ready or not main_task:
+                    # A non-empty ready queue or an empty main task
+                    # means that the waiting should be as close to
+                    # non-blocking as possible.
                     timeout = 0
-                    data = "READY"
+                    data = "NON_BLOCKING"
+
                 else:
+                    # Find the next deadline to wait for
                     now = monotonic()
-                    next_deadline = sleepq.next_deadline(now)
-                    if next_deadline and next_deadline > 0.1 and selector_getmap():
+                    timeout = sleepq.next_deadline(now)
+                    data = "SLEEP_WAKE"
+
+                    # Shorten timeouts if there is I/O that could
+                    # complete in the future.
+                    if (timeout is None) or (timeout > 0.1 and selector_getmap()):
                         timeout = 0.1
                         data = "SELECT"
-                    else:
-                        timeout = next_deadline
-                        data = "SLEEP_WAKE"
 
                 # Set timeout if required
                 if timeout is not None:

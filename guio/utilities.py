@@ -3,6 +3,7 @@ import logging
 from contextlib import contextmanager
 from tkinter import Misc, TclError, Tk, Widget
 
+from curio.sync import Event
 from curio.thread import spawn_thread, AWAIT
 
 from .event import current_toplevel
@@ -26,12 +27,12 @@ async def run_in_main(func_, *args, **kwargs):
         return AWAIT(_run_in_main_helper(func_, args, kwargs))
 
 
-def _dialog_helper(func, args, kwargs, x, y, close):
+def _dialog_helper(func, args, kwargs, x, y, event):
     def check_close():
-        if not close[0]:
-            root.after(500, check_close)
-        else:
+        if event.is_set():
             destroy(root)
+        else:
+            root.after(500, check_close)
 
     root = Tk()
     try:
@@ -59,13 +60,13 @@ async def dialog(func_, *args, **kwargs):
     toplevel = await current_toplevel()
     geometry = toplevel.geometry()
     _, x, y = geometry.split("+")  # "WxH+X+Y".split("+") == ["WxH", "X", "Y"]
-    close = [False]
-    args = (func_, args, kwargs, x, y, close)
+    event = Event()
+    args = (func_, args, kwargs, x, y, event)
     thread = await spawn_thread(_dialog_helper, *args)
     try:
         return await thread.join()
     finally:
-        close[0] = True
+        await event.set()
 
 
 def exists(widget):
