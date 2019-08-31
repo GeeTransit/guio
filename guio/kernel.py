@@ -5,7 +5,6 @@ import tkinter
 
 from collections import deque
 from contextlib import contextmanager, ExitStack
-from inspect import getgeneratorstate, GEN_CLOSED, GEN_RUNNING
 from functools import wraps
 from selectors import EVENT_READ, EVENT_WRITE
 from socket import socketpair
@@ -86,12 +85,6 @@ class Kernel(CurioKernel):
 
         # Toplevel and frame (tkinter loop)
         toplevel = frame = None
-
-        # Store result / exception of main loop
-        result = None
-
-        # Store last window close time
-        _last_close = None
 
         # Restore kernel state
         event_queue = kernel._event_queue
@@ -399,20 +392,6 @@ class Kernel(CurioKernel):
 
         # --- Tkinter helpers ---
 
-        async def wrap_coro(coro):
-            return await coro
-
-        def send(gen, data):
-            try:
-                return gen.send(data)
-            except BaseException as e:
-                nonlocal result
-                destroy(frame)
-                if not isinstance(e, StopIteration):
-                    result = e
-                elif e.value is not None:
-                    result = e.value
-
         @contextmanager
         def bind(widget, func, events):
             widget_bind = widget.bind
@@ -433,21 +412,7 @@ class Kernel(CurioKernel):
                 toplevel.protocol("WM_DELETE_WINDOW", toplevel.destroy)
 
 
-        # --- Tkinter loop helpers ---
-
-        # Send if the loop is suspended (True if sent, False otherwise)
-        _unsafe_states = frozenset({GEN_CLOSED, GEN_RUNNING})
-        def safe_send(data, *, retry=True, _unsafe_states=_unsafe_states):
-            state = getgeneratorstate(loop)
-            if state in _unsafe_states:
-                if retry:
-                    frame.after(1, lambda: safe_send(data, retry=True))
-                else:
-                    logger.info("Couldn't send data: %r", data)
-                return False
-            else:
-                send(loop, data)
-                return True
+        # --- Tkinter callback decorator ---
 
         # Decorator to return "break" for tkinter callbacks
         def callback(func):
@@ -467,31 +432,32 @@ class Kernel(CurioKernel):
             if event.widget is toplevel:
                 event_queue_append(event)
                 if event_wait:
-                    safe_send("EVENT_WAKE")
+                    loop.send("EVENT_WAKE")
 
         @callback
         def send_other_event(event):
             if event.widget is not toplevel:
                 event_queue_append(event)
                 if event_wait:
-                    safe_send("EVENT_WAKE")
+                    loop.send("EVENT_WAKE")
 
         @callback
         def send_destroy_event(event):
             if event.widget is toplevel:
                 event_queue_append(event)
                 if event_wait:
-                    frame.after(1, lambda: safe_send("EVENT_WAKE"))
+                    loop.send("EVENT_WAKE")
 
+        _last_close = None
         @callback
         def close_window():
             nonlocal _last_close
             event_queue_append(CloseWindow("X was pressed"))
             now = monotonic()
             if _last_close and _last_close + 0.5 > now:
-                safe_send(RuntimeError("Kernel was force closed"))
+                loop.throw(RuntimeError("Kernel was force closed"))
             if event_wait:
-                safe_send("EVENT_WAKE")
+                loop.send("EVENT_WAKE")
             _last_close = now
 
 
@@ -617,24 +583,23 @@ class Kernel(CurioKernel):
                         timeout = 0.1
                         data = "SELECT"
 
-                # Set timeout if required
+                # Schedule after callback if required
                 if timeout is not None:
-                    id_ = frame.after(max(int(timeout*1000), 1), lambda: safe_send(data))
+                    id_ = frame.after(
+                        max(int(timeout*1000), 1),
+                        lambda data=data: loop.send(data)
+                    )
 
                 # Wait for callback
                 try:
-                    info = (yield)
+                    data = (yield)
 
                 # Cancel after callback
                 finally:
                     if timeout is not None:
                         frame.after_cancel(id_)
 
-                # Handle exceptions (similar to `curio.traps._kernel_trap`)
-                if isinstance(info, BaseException):
-                    raise info
-
-                if info == "EVENT_WAKE":
+                if data == "EVENT_WAKE":
                     for task in event_wait.pop(len(event_wait)):
                         reschedule(task)
 
@@ -643,7 +608,8 @@ class Kernel(CurioKernel):
 
                 event_tasks = {task for task in tasks.values() if iseventtask(task)}
 
-                # Check that there are event tasks and offset is non zero
+                # Check that there are event tasks and offset is non
+                # zero
                 if event_tasks:
                     min_offset = min(task.next_event for task in event_tasks)
                     if min_offset:
@@ -652,12 +618,13 @@ class Kernel(CurioKernel):
                         for task in event_tasks:
                             task.next_event -= min_offset
 
-                # Clear the queue if there aren't any tasks to collect events
-                # Note: This will leave at most 50 events on the queue.
+                # Clear the queue if there aren't any tasks to collect
+                # events. Note that this will leave at most 50 events on
+                # the queue.
                 elif len(event_queue) > 50:
 
-                    # Leave 25 so that this doesn't run everytime a new event
-                    # is added and the length pops over 50.
+                    # Leave 25 so that this doesn't run everytime a new
+                    # event is added and the length pops over 50.
                     event_offset = len(event_queue) - 25
                     logger.info("Clearing %s events from event queue", event_offset)
                     for _ in range(event_offset):
@@ -725,9 +692,10 @@ class Kernel(CurioKernel):
                             current._trap_result = traps[trap[0]](*trap[1:])
 
                         except BaseException:
-                            # If an exception happens here, it puts the task in an
-                            # unrecoverable state. The kernel "crashes" and stops
-                            # any further attempt to use it.
+                            # If an exception happens here, it puts the
+                            # task in an unrecoverable state. The kernel
+                            # "crashes" and stops any further attempt to
+                            # use it.
                             kernel._shutdown_funcs = None
                             raise
 
@@ -753,13 +721,11 @@ class Kernel(CurioKernel):
 
         # --- Outer loop preparation ---
 
-        # Wrap toplevel and loop with closing managers
+        # Wrap toplevel with context managers
         with ExitStack() as stack:
             enter = stack.enter_context
 
-            kernel._toplevel = toplevel = tkinter.Tk()
-            enter(destroying(toplevel))
-
+            kernel._toplevel = toplevel = enter(destroying(tkinter.Tk()))
             enter(bind(toplevel, send_tk_event, kernel._tk_events))
             enter(bind(toplevel, send_other_event, kernel._other_events))
             enter(bind(toplevel, send_destroy_event, ("<Destroy>",)))
@@ -771,30 +737,39 @@ class Kernel(CurioKernel):
             while True:
 
                 # If an exception happened, raise it here
-                if isinstance(result, BaseException):
-                    raise result
+                if loop and loop.exception:
+                    raise loop.exception
 
-                # Get coro to run
-                data = (yield result)
-                loop = _inner_loop(data)
-                del data
+                # Receive work to run
+                work = (yield (loop.result if loop else None))
+                inner_loop = _inner_loop(work)
+                del work
 
-                # Run until frame is destroyed
-                # Note: `wait_window` will spawn in tkinter's event loop
-                # but will end when the widget is destroyed. `frame` will
-                # be destroyed when an exception happens in sending a value
-                # to the loop.
-                with destroying(tkinter.Frame(toplevel)) as frame:
-                    send(loop, None)
-                    frame.wait_window()
+                # Wrap frame and loop in context managers
+                with ExitStack() as loop_stack:
+                    loop_enter = loop_stack.enter_context
+
+                    frame = loop_enter(destroying(tkinter.Frame(toplevel)))
+                    loop = _GenWrapper(inner_loop, frame)
+                    del inner_loop
+
+                    # Run until frame is destroyed. Note that
+                    # `wait_window` will spawn in tkinter's event loop
+                    # but will end when the widget is destroyed. `frame`
+                    # will be destroyed when the loop ends or when an
+                    # exception happens while sending a value to the
+                    # loop.
+                    loop.send(None)
+                    if loop.gi_frame:
+                        frame.wait_window()
 
                 # Check for exceptions
-                if getgeneratorstate(loop) != GEN_CLOSED:
+                if loop.gi_frame:
                     loop.close()
-                    raise RuntimeError("Frame closed before main task finished") from result
+                    raise RuntimeError("Frame closed before main task finished")
 
                 if not exists(toplevel):
-                    raise RuntimeError("Toplevel was destroyed") from result
+                    raise RuntimeError("Toplevel was destroyed")
 
 
 @wraps(curio_run)
@@ -825,7 +800,101 @@ def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
         return kernel.run(corofunc, *args)
 
 
-if __name__ == "__main__":
-    async def test():
-        return 0
-    run(test)
+# Wrapper class that hides away the implicit rescheduling when the
+# generator is still running.
+class _GenWrapper:
+
+    def __init__(self, gen, frame):
+        self._gen = gen
+        self._frame = frame
+        self._final_val = None
+        self._final_exc = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, ty, val, tb):
+        self.close()
+
+    def __del__(self):
+        self._gen.close()
+
+    def _safe_call(func):
+        @wraps(func)
+        def _wrapper(self, *args, **kwargs):
+
+            # Reschedule if called from within itself
+            if self.gi_running:
+                self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
+
+            # Only run if `gen` isn't closed
+            elif self.gi_frame is not None:
+                try:
+                    return func(self._gen, *args, **kwargs)
+                except BaseException as e:
+                    destroy(self._frame)
+                    if isinstance(e, StopIteration):
+                        self.result = e.value
+                    else:
+                        self.exception = e
+
+        return _wrapper
+
+    def __iter__(self):
+        return self
+
+    @property
+    def result(self):
+        if self.gi_frame:
+            raise RuntimeError("Generator still running")
+        if self._final_exc:
+            raise self._final_exc
+        return self._final_val
+
+    @result.setter
+    def result(self, value):
+        self._final_val = value
+        self._final_exc = None
+
+    @property
+    def exception(self):
+        if self.gi_frame:
+            raise RuntimeError("Generator still running")
+        return self._final_exc
+
+    @exception.setter
+    def exception(self, value):
+        self._final_val = None
+        self._final_exc = value
+
+    @_safe_call
+    def __next__(gen):
+        return next(gen)
+
+    @_safe_call
+    def send(gen, arg):
+        return gen.send(arg)
+
+    @_safe_call
+    def throw(gen, ty, val=None, tb=None):
+        return gen.throw(ty, val, tb)
+
+    @_safe_call
+    def close(gen):
+        gen.close()
+
+    @property
+    def gi_code(self):
+        return self._gen.gi_code
+
+    @property
+    def gi_frame(self):
+        return self._gen.gi_frame
+
+    @property
+    def gi_running(self):
+        return self._gen.gi_running
+
+    @property
+    def gi_yieldfrom(self):
+        return self._gen.gi_yieldfrom
