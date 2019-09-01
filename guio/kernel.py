@@ -746,11 +746,11 @@ class Kernel(CurioKernel):
                 del work
 
                 # Wrap frame and loop in context managers
-                with ExitStack() as loop_stack:
-                    loop_enter = loop_stack.enter_context
+                with ExitStack() as inner_stack:
+                    inner_enter = inner_stack.enter_context
 
-                    frame = loop_enter(destroying(tkinter.Frame(toplevel)))
-                    loop = _GenWrapper(inner_loop, frame)
+                    frame = inner_enter(destroying(tkinter.Frame(toplevel)))
+                    loop = inner_enter(_GenWrapper(inner_loop, frame))
                     del inner_loop
 
                     # Run until frame is destroyed. Note that
@@ -763,13 +763,14 @@ class Kernel(CurioKernel):
                     if loop.gi_frame:
                         frame.wait_window()
 
-                # Check for exceptions
-                if loop.gi_frame:
-                    loop.close()
-                    raise RuntimeError("Frame closed before main task finished")
+                    # Check that the loop closed after `frame` was
+                    # destroyed.
+                    if loop.gi_frame:
+                        raise RuntimeError("Frame closed before main task finished")
 
-                if not exists(toplevel):
-                    raise RuntimeError("Toplevel was destroyed")
+                    # Check that toplevel still exists.
+                    if not exists(toplevel):
+                        raise RuntimeError("Toplevel was destroyed")
 
 
 @wraps(curio_run)
@@ -832,11 +833,11 @@ class _GenWrapper:
                 try:
                     return func(self._gen, *args, **kwargs)
                 except BaseException as e:
-                    destroy(self._frame)
                     if isinstance(e, StopIteration):
                         self.result = e.value
                     else:
                         self.exception = e
+                    destroy(self._frame)
 
         return _wrapper
 
