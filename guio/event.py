@@ -22,11 +22,14 @@ async def pop_event(*, blocking=True):
 
 class aevents:
 
+    def __init__(self, *, blocking=True):
+        self.blocking = blocking
+
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        return await pop_event()
+        return await pop_event(blocking=self.blocking)
 
 
 async def current_toplevel():
