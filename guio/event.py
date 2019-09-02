@@ -29,7 +29,12 @@ class aevents:
         return self
 
     async def __anext__(self):
-        return await pop_event(blocking=self.blocking)
+        if self.blocking:
+            return await pop_event()
+        try:
+            return await pop_event(blocking=False)
+        except NoEvent:
+            raise StopAsyncIteration
 
 
 async def current_toplevel():
