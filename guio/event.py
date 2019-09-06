@@ -34,7 +34,7 @@ class aevents:
         try:
             return await pop_event(blocking=False)
         except NoEvent:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
 
 async def current_toplevel():
@@ -45,11 +45,10 @@ def iseventtask(task):
     return (getattr(task, "next_event", -1) >= 0)
 
 
-async def set_current_event():
+async def seteventtask(isevent):
     task = await current_task()
-    task.next_event = 0
+    if iseventtask(task) != isevent:
+        task.next_event = isevent - 1
 
-
-async def unset_current_event():
-    task = await current_task()
-    task.next_event = -1
+set_current_event = lambda: seteventtask(True)
+unset_current_event = lambda: seteventtask(False)
