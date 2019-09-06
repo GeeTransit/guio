@@ -166,7 +166,7 @@ class Kernel(CurioKernel):
             current.cancel_func = cancel_func
 
             if current._last_io:
-                _unregister_event(*current._last_io)
+                unregister_event(*current._last_io)
                 current._last_io = None
 
             running = None
@@ -687,17 +687,9 @@ class Kernel(CurioKernel):
                                     raise
                             break
 
-                        try:
+                        else:
                             # Find and run requested trap
                             current._trap_result = traps[trap[0]](*trap[1:])
-
-                        except BaseException:
-                            # If an exception happens here, it puts the
-                            # task in an unrecoverable state. The kernel
-                            # "crashes" and stops any further attempt to
-                            # use it.
-                            kernel._shutdown_funcs = None
-                            raise
 
 
                     # --- Task suspended / terminated ---
@@ -707,7 +699,7 @@ class Kernel(CurioKernel):
                         current.suspend_func = None
 
                     if current._last_io:
-                        unregister(*current._last_io)
+                        unregister_event(*current._last_io)
                         current._last_io = None
 
                     for a in _activations:
@@ -736,8 +728,10 @@ class Kernel(CurioKernel):
 
             while True:
 
-                # If an exception happened, raise it here
+                # If an exception happened in the loop, the kernel
+                # "crashes" and stops any further attempt to use it.
                 if loop and loop.exception:
+                    kernel._shutdown_funcs = None
                     raise loop.exception
 
                 # Receive work to run
