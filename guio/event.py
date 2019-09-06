@@ -6,7 +6,7 @@ from .traps import *
 
 __all__ = [
     "pop_event", "aevents", "current_toplevel", "iseventtask",
-    "set_current_event", "unset_current_event",
+    "seteventtask", "set_current_event", "unset_current_event",
 ]
 
 
@@ -48,7 +48,7 @@ def iseventtask(task):
 async def seteventtask(isevent):
     task = await current_task()
     if iseventtask(task) != isevent:
-        task.next_event = isevent - 1
+        task.next_event = isevent - 1  # (True == 1) and (False == 0)
 
 set_current_event = lambda: seteventtask(True)
 unset_current_event = lambda: seteventtask(False)
