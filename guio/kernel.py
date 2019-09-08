@@ -14,11 +14,10 @@ from curio import __version__ as CURIO_VERSION
 from curio.errors import *
 from curio.kernel import run as curio_run, Kernel as CurioKernel
 from curio.sched import SchedBarrier
-from curio.task import Task
 from curio.traps import _read_wait
 
 from .errors import *
-from .event import iseventtask
+from .task import Task
 from .utilities import *
 
 
@@ -367,17 +366,17 @@ class Kernel(CurioKernel):
         @event
         def _trap_pop_event():
             try:
-                event = event_queue[current.next_event]
+                event = event_queue[current._next_event]
             except IndexError:
                 return NoEvent("No event available")
             else:
-                current.next_event += 1
+                current._next_event += 1
                 return event
 
         @blocking
         @event
         def _trap_wait_event():
-            if current.next_event >= len(event_queue):
+            if current._next_event >= len(event_queue):
                 suspend("EVENT_WAIT", event_wait.add(current))
 
         def _trap_get_kernel():
@@ -493,7 +492,7 @@ class Kernel(CurioKernel):
         # --- Tkinter loop (run using tkinter's mainloop) ---
         # Note: A new inner loop is created for each "iteration" of the
         # kernel loop. Shared state is stored outside the inner loop to
-        # reduce delays.
+        # reduce slowdowns.
 
         def _inner_loop(coro):
 
@@ -507,7 +506,7 @@ class Kernel(CurioKernel):
             if coro:
                 main_task = new_task(coro)
                 main_task.report_crash = False
-                main_task.next_event = 0
+                main_task.is_event = True
             else:
                 main_task = None
             del coro
@@ -606,17 +605,20 @@ class Kernel(CurioKernel):
 
                 # --- Run event clearer (event garbage collection :P) ---
 
-                event_tasks = {task for task in tasks.values() if iseventtask(task)}
+                event_tasks = {task for task in tasks.values() if task.is_event}
 
-                # Check that there are event tasks and offset is non
-                # zero
+                # Check that there are event tasks and offset is
+                # non-zero
                 if event_tasks:
-                    min_offset = min(task.next_event for task in event_tasks)
+                    min_offset = min(task._next_event for task in event_tasks)
                     if min_offset:
                         for _ in range(min_offset):
                             event_queue.popleft()
-                        for task in event_tasks:
-                            task.next_event -= min_offset
+                        for task in tasks.values():
+                            if task.is_event:
+                                task._next_event -= min_offset
+                            else:
+                                task._next_event = min(-1, task._next_event + min_offset)
 
                 # Clear the queue if there aren't any tasks to collect
                 # events. Note that this will leave at most 50 events on
@@ -787,7 +789,7 @@ def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
 
     # Check if a monitor has been requested
     if with_monitor or "CURIOMONITOR" in os.environ:
-        from .monitor import Monitor
+        from curio.monitor import Monitor
         m = Monitor(kernel)
         kernel._call_at_shutdown(m.close)
 
@@ -874,9 +876,8 @@ class _GenWrapper:
     def throw(gen, ty, val=None, tb=None):
         return gen.throw(ty, val, tb)
 
-    @_safe_call
-    def close(gen):
-        gen.close()
+    def close(self):
+        self.throw(GeneratorExit)
 
     @property
     def gi_code(self):
