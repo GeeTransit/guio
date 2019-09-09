@@ -14,6 +14,7 @@ from curio import __version__ as CURIO_VERSION
 from curio.errors import *
 from curio.kernel import run as curio_run, Kernel as CurioKernel
 from curio.sched import SchedBarrier
+from curio.timequeue import TimeQueue
 from curio.traps import _read_wait
 
 from .errors import *
@@ -63,15 +64,7 @@ class Kernel(CurioKernel):
     )
 
 
-    @wraps(CurioKernel.__init__)
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self._event_queue = deque()
-        self._event_wait = SchedBarrier()
-
-
-    def _run_coro(kernel):
+    def _make_kernel_runtime(kernel):
 
         # --- Kernel state ---
 
@@ -79,20 +72,25 @@ class Kernel(CurioKernel):
         current = None
         running = False
 
-        # Main loop
+        # Toplevel and outer stack
+        toplevel = None
+        stack = ExitStack()
+        kernel._call_at_shutdown(stack.close)
+
+        # Inner loop and dummy frame (tkinter loop)
         loop = None
+        frame = None
 
-        # Toplevel and frame (tkinter loop)
-        toplevel = frame = None
-
-        # Restore kernel state
-        event_queue = kernel._event_queue
-        event_wait = kernel._event_wait
-        ready = kernel._ready
+        # Restore kernel attributes
         selector = kernel._selector
-        sleepq = kernel._sleepq
         tasks = kernel._tasks
-        wake_queue = kernel._wake_queue
+
+        # Internal kernel state
+        event_queue = deque()
+        event_wait = SchedBarrier()
+        ready = deque()
+        sleepq = TimeQueue()
+        wake_queue = deque()
         _activations = []
 
 
@@ -117,9 +115,12 @@ class Kernel(CurioKernel):
 
         # --- Future processing ---
 
+        # Loopback sockets
+        notify_sock = None
+        wait_sock = None
+
         async def kernel_task():
             wake_queue_popleft = wake_queue.popleft
-            wait_sock = kernel._wait_sock
 
             while True:
                 await _read_wait(wait_sock)
@@ -141,14 +142,15 @@ class Kernel(CurioKernel):
         def wake(task=None, future=None):
             if task:
                 wake_queue.append((task, future))
-            kernel._notify_sock.send(b"\x00")
+            notify_sock.send(b"\x00")
 
         def init_loopback():
-            kernel._notify_sock, kernel._wait_sock = socketpair()
-            kernel._wait_sock.setblocking(False)
-            kernel._notify_sock.setblocking(False)
-            kernel._call_at_shutdown(kernel._notify_sock.close)
-            kernel._call_at_shutdown(kernel._wait_sock.close)
+            nonlocal notify_sock, wait_sock
+            notify_sock, wait_sock = socketpair()
+            wait_sock.setblocking(False)
+            notify_sock.setblocking(False)
+            kernel._call_at_shutdown(notify_sock.close)
+            kernel._call_at_shutdown(wait_sock.close)
 
 
         # --- Task helpers ---
@@ -174,6 +176,8 @@ class Kernel(CurioKernel):
             task = Task(coro)
             tasks[task.id] = task
             reschedule(task)
+            for a in _activations:
+                a.created(task)
             return task
 
         def cancel_task(task, exc):
@@ -246,7 +250,7 @@ class Kernel(CurioKernel):
         def event(func):
             @wraps(func)
             def _wrapped(*args):
-                if not iseventtask(current):
+                if not current.is_event:
                     return TaskNotEvent("Non-event task cannot access events")
                 else:
                     return func(*args)
@@ -256,7 +260,7 @@ class Kernel(CurioKernel):
         # --- Traps ---
 
         @blocking
-        def _trap_io(fileobj, event, state):
+        def trap_io(fileobj, event, state):
             if current._last_io != (fileobj, event):
                 if current._last_io:
                     unregister_event(*current._last_io)
@@ -268,7 +272,7 @@ class Kernel(CurioKernel):
             current._last_io = None
             suspend(state, lambda: unregister_event(fileobj, event))
 
-        def _trap_io_waiting(fileobj):
+        def trap_io_waiting(fileobj):
             try:
                 key = selector_getkey(fileobj)
             except KeyError:
@@ -280,7 +284,7 @@ class Kernel(CurioKernel):
                 return (rtask, wtask)
 
         @blocking
-        def _trap_future_wait(future, event):
+        def trap_future_wait(future, event):
             current.future = future
             future.add_done_callback(lambda fut, task=current: wake(task, fut))
             if event:
@@ -293,12 +297,12 @@ class Kernel(CurioKernel):
 
             suspend("FUTURE_WAIT", _cancel)
 
-        def _trap_spawn(coro):
+        def trap_spawn(coro):
             task = new_task(coro)
             task.parentid = current.id
             return task
 
-        def _trap_cancel_task(task, exc=TaskCancelled, val=None):
+        def trap_cancel_task(task, exc=TaskCancelled, val=None):
             if task.cancelled:
                 return
             if not isinstance(exc, BaseException):
@@ -308,19 +312,19 @@ class Kernel(CurioKernel):
             cancel_task(task, exc)
 
         @blocking
-        def _trap_sched_wait(sched, state):
+        def trap_sched_wait(sched, state):
             suspend(state, sched.add(current))
 
-        def _trap_sched_wake(sched, n):
+        def trap_sched_wake(sched, n):
             tasks = sched.pop(n)
             for task in tasks:
                 reschedule(task)
 
-        def _trap_clock():
+        def trap_clock():
             return monotonic()
 
         @blocking
-        def _trap_sleep(clock, absolute):
+        def trap_sleep(clock, absolute):
             nonlocal running
             if clock == 0:
                 reschedule(current)
@@ -341,7 +345,7 @@ class Kernel(CurioKernel):
 
             suspend("TIME_SLEEP", _cancel)
 
-        def _trap_set_timeout(timeout):
+        def trap_set_timeout(timeout):
             old_timeout = current.timeout
 
             if timeout is not None:
@@ -352,8 +356,9 @@ class Kernel(CurioKernel):
 
             return old_timeout
 
-        def _trap_unset_timeout(previous):
+        def trap_unset_timeout(previous):
             now = monotonic()
+            set_timeout(None, "timeout")
             set_timeout(previous, "timeout")
 
             if not previous or previous >= now:
@@ -364,7 +369,7 @@ class Kernel(CurioKernel):
             return now
 
         @event
-        def _trap_pop_event():
+        def trap_pop_event():
             try:
                 event = event_queue[current._next_event]
             except IndexError:
@@ -375,17 +380,17 @@ class Kernel(CurioKernel):
 
         @blocking
         @event
-        def _trap_wait_event():
+        def trap_wait_event():
             if current._next_event >= len(event_queue):
                 suspend("EVENT_WAIT", event_wait.add(current))
 
-        def _trap_get_kernel():
+        def trap_get_kernel():
             return kernel
 
-        def _trap_get_current():
+        def trap_get_current():
             return current
 
-        def _trap_get_toplevel():
+        def trap_get_toplevel():
             return toplevel
 
 
@@ -399,8 +404,9 @@ class Kernel(CurioKernel):
             try:
                 yield bindings
             finally:
-                for info in bindings:
-                    widget_unbind(*info)
+                if exists(widget):
+                    for info in bindings:
+                        widget_unbind(*info)
 
         @contextmanager
         def protocol(toplevel, func):
@@ -408,7 +414,8 @@ class Kernel(CurioKernel):
             try:
                 yield
             finally:
-                toplevel.protocol("WM_DELETE_WINDOW", toplevel.destroy)
+                if exists(toplevel):
+                    toplevel.protocol("WM_DELETE_WINDOW", toplevel.destroy)
 
 
         # --- Tkinter callback decorator ---
@@ -455,44 +462,46 @@ class Kernel(CurioKernel):
             now = monotonic()
             if _last_close and _last_close + 0.5 > now:
                 loop.throw(RuntimeError("Kernel was force closed"))
-            if event_wait:
-                loop.send("EVENT_WAKE")
-            _last_close = now
+            else:
+                if event_wait:
+                    loop.send("EVENT_WAKE")
+                _last_close = now
 
 
         # --- Final setup ---
 
+        # Trap table
         kernel._traps = traps = {
             key:value
             for key, value in locals().items()
-            if key.startswith("_trap_")
+            if key.startswith("trap_")
         }
 
-        if kernel._kernel_task_id is None:
-            init_loopback()
-            t = new_task(kernel_task())
-            t.daemon = True
-            kernel._kernel_task_id = t.id
-            del t
+        # Loopback sockets
+        init_loopback()
+        task = new_task(kernel_task())
+        task.daemon = True
 
-        _activations = [
+        # Activations
+        kernel._activations = _activations = [
             (act() if isinstance(act, type) and issubclass(act, Activation) else act)
             for act in kernel._activations
         ]
-        kernel._activations = _activations
-
         for act in _activations:
             act.activate(kernel)
-            if kernel._kernel_task_id:
-                act.created(kernel._tasks[kernel._kernel_task_id])
 
-        main_task = None
+        # Toplevel creation
+        toplevel = stack.enter_context(destroying(tkinter.Tk()))
+        stack.enter_context(bind(toplevel, send_tk_event, kernel._tk_events))
+        stack.enter_context(bind(toplevel, send_other_event, kernel._other_events))
+        stack.enter_context(bind(toplevel, send_destroy_event, ("<Destroy>",)))
+        stack.enter_context(protocol(toplevel, close_window))
 
 
         # --- Tkinter loop (run using tkinter's mainloop) ---
-        # Note: A new inner loop is created for each "iteration" of the
-        # kernel loop. Shared state is stored outside the inner loop to
-        # reduce slowdowns.
+        # Note: A new inner loop is created for every piece of work that
+        # gets submitted to the kernel. Shared state is stored outside
+        # the inner loop to reduce slowdowns.
 
         def _inner_loop(coro):
 
@@ -517,18 +526,10 @@ class Kernel(CurioKernel):
             while True:
 
 
-                # --- Check if main task completed ---
-
-                if (main_task and main_task.terminated) or (not ready and not main_task):
-                    if main_task:
-                        main_task.joined = True
-                    return main_task
-
-
                 # --- I/O event waiting ---
 
                 try:
-                    # Return immediately
+                    # Don't block here.
                     events = selector_select(0)
                 except OSError as e:
                     # Windows throws an error if the selector is empty.
@@ -713,78 +714,66 @@ class Kernel(CurioKernel):
                     running = False
 
 
-        # --- Outer loop preparation ---
+                # --- Check if main task completed ---
 
-        # Wrap toplevel with context managers
-        with ExitStack() as stack:
-            enter = stack.enter_context
-
-            kernel._toplevel = toplevel = enter(destroying(tkinter.Tk()))
-            enter(bind(toplevel, send_tk_event, kernel._tk_events))
-            enter(bind(toplevel, send_other_event, kernel._other_events))
-            enter(bind(toplevel, send_destroy_event, ("<Destroy>",)))
-            enter(protocol(toplevel, close_window))
+                if main_task:
+                    if main_task.terminated:
+                        main_task.joined = True
+                        return main_task
+                else:
+                    return None
 
 
-            # --- Outer loop ---
+        # --- Runner function ---
 
-            while True:
+        def _runner(work):
 
+            nonlocal loop, frame
+
+            # Receive work and get result
+            inner_loop = _inner_loop(work)
+            del work
+
+            # Wrap frame and loop in context managers
+            with ExitStack() as inner_stack:
+                frame = inner_stack.enter_context(destroying(tkinter.Frame(toplevel)))
+                loop = inner_stack.enter_context(_GenWrapper(inner_loop, frame))
+                del inner_loop
+
+                # Run until frame is destroyed. Note that `wait_window`
+                # will spawn in tkinter's event loop but will return
+                # when the widget is destroyed. `frame` will be
+                # destroyed when the loop ends or when an exception
+                # happens while sending a value to the loop.
+                loop.send(None)
+                if not loop.closed:
+                    frame.wait_window()
+
+                # Check that the loop closed after `frame` was
+                # destroyed.
+                if not loop.closed:
+                    raise RuntimeError("Frame closed before main task finished")
+
+            try:
+                # Check that toplevel still exists.
+                if not exists(toplevel):
+                    raise RuntimeError("Toplevel was destroyed")
+
+                # Return end result
+                return loop.result
+
+            except BaseException:
                 # If an exception happened in the loop, the kernel
                 # "crashes" and stops any further attempt to use it.
-                if loop and loop.exception:
-                    kernel._shutdown_funcs = None
-                    raise loop.exception
+                kernel._shutdown_funcs = None
+                stack.close()  # Close the toplevel
+                raise
 
-                # Receive work to run
-                work = (yield (loop.result if loop else None))
-                inner_loop = _inner_loop(work)
-                del work
-
-                # Wrap frame and loop in context managers
-                with ExitStack() as inner_stack:
-                    inner_enter = inner_stack.enter_context
-
-                    frame = inner_enter(destroying(tkinter.Frame(toplevel)))
-                    loop = inner_enter(_GenWrapper(inner_loop, frame))
-                    del inner_loop
-
-                    # Run until frame is destroyed. Note that
-                    # `wait_window` will spawn in tkinter's event loop
-                    # but will end when the widget is destroyed. `frame`
-                    # will be destroyed when the loop ends or when an
-                    # exception happens while sending a value to the
-                    # loop.
-                    loop.send(None)
-                    if loop.gi_frame:
-                        frame.wait_window()
-
-                    # Check that the loop closed after `frame` was
-                    # destroyed.
-                    if loop.gi_frame:
-                        raise RuntimeError("Frame closed before main task finished")
-
-                    # Check that toplevel still exists.
-                    if not exists(toplevel):
-                        raise RuntimeError("Toplevel was destroyed")
+        return _runner
 
 
 @wraps(curio_run)
 def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
-    """
-    Run the guio kernel with an initial task and execute until the
-    initial task terminates. Returns the task's final result (if any).
-    This is a convenience function that should primarily be used for
-    launching the top-level task of an curio/guio-based application.  It
-    creates an entirely new kernel, runs the given task to completion,
-    and concludes by shutting down the kernel, releasing all resources
-    used.
-
-    Don't use this function if you're repeatedly launching a lot of
-    new tasks to run in curio/guio. Instead, create a Kernel instance and
-    use its run() method instead.
-    """
-
     kernel = Kernel(**kernel_kwargs)
 
     # Check if a monitor has been requested
@@ -792,13 +781,17 @@ def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
         from curio.monitor import Monitor
         m = Monitor(kernel)
         kernel._call_at_shutdown(m.close)
+        kernel.run(m.start)
 
     with kernel:
         return kernel.run(corofunc, *args)
 
 
 # Wrapper class that hides away the implicit rescheduling when the
-# generator is still running.
+# generator is still running. Note that this doesn't attempt to fulfill
+# the iterator protocol nor the coroutine methods as this is meant for
+# use in tkinter callbacks. Exceptions that go unhandled in tkinter are
+# hardcoded to be printed out; we prevent that from happening here.
 class _GenWrapper:
 
     def __init__(self, gen, frame):
@@ -821,11 +814,11 @@ class _GenWrapper:
         def _wrapper(self, *args, **kwargs):
 
             # Reschedule if called from within itself
-            if self.gi_running:
+            if self.running:
                 self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
 
             # Only run if `gen` isn't closed
-            elif self.gi_frame is not None:
+            elif not self.closed:
                 try:
                     return func(self._gen, *args, **kwargs)
                 except BaseException as e:
@@ -837,12 +830,9 @@ class _GenWrapper:
 
         return _wrapper
 
-    def __iter__(self):
-        return self
-
     @property
     def result(self):
-        if self.gi_frame:
+        if not self.closed:
             raise RuntimeError("Generator still running")
         if self._final_exc:
             raise self._final_exc
@@ -855,7 +845,7 @@ class _GenWrapper:
 
     @property
     def exception(self):
-        if self.gi_frame:
+        if not self.closed:
             raise RuntimeError("Generator still running")
         return self._final_exc
 
@@ -863,10 +853,6 @@ class _GenWrapper:
     def exception(self, value):
         self._final_val = None
         self._final_exc = value
-
-    @_safe_call
-    def __next__(gen):
-        return next(gen)
 
     @_safe_call
     def send(gen, arg):
@@ -880,17 +866,9 @@ class _GenWrapper:
         self.throw(GeneratorExit)
 
     @property
-    def gi_code(self):
-        return self._gen.gi_code
+    def closed(self):
+        return self._gen.gi_frame is None
 
     @property
-    def gi_frame(self):
-        return self._gen.gi_frame
-
-    @property
-    def gi_running(self):
-        return self._gen.gi_running
-
-    @property
-    def gi_yieldfrom(self):
-        return self._gen.gi_yieldfrom
+    def running(self):
+        return bool(self._gen.gi_running)

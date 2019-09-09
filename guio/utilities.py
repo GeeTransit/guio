@@ -1,12 +1,12 @@
 import logging
 
 from contextlib import contextmanager
-from tkinter import Misc, TclError, Tk, Widget
+from tkinter import TclError, Tk
 
 from curio.sync import Event
 from curio.thread import spawn_thread, AWAIT
 
-from .event import current_toplevel
+from .task import current_toplevel
 
 __all__ = [
     "run_in_main", "dialog",
