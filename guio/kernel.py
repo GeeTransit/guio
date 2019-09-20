@@ -10,58 +10,56 @@ from selectors import EVENT_READ, EVENT_WRITE
 from socket import socketpair
 from time import monotonic
 
-from curio import __version__ as CURIO_VERSION
 from curio.errors import *
 from curio.kernel import run as curio_run, Kernel as CurioKernel
 from curio.sched import SchedBarrier
+from curio.task import Task
 from curio.timequeue import TimeQueue
 from curio.traps import _read_wait
 
 from .errors import *
-from .task import Task
+from .event import ProtocolEvent
 from .utilities import *
 
 
 __all__ = ["Kernel", "run"]
 
 
-CURIO_VERSION = tuple(int(i) for i in CURIO_VERSION.split("."))
-
-
 logger = logging.getLogger(__name__)
+
 
 
 class Kernel(CurioKernel):
 
-    _tk_events = (
-        "<Activate>",
-        "<Circulate>",
-        "<Configure>",
-        "<Colormap>",
-        "<Deactivate>",
-        "<FocusIn>",
-        "<FocusOut>",
-        "<Gravity>",
-        "<Key>",
-        "<KeyPress>",
-        "<KeyRelease>",
-        "<MouseWheel>",
-        "<Property>",
-    )
-
-    _other_events = (
-        "<Button>",
-        "<ButtonPress>",
-        "<ButtonRelease>",
-        "<Enter>",
-        "<Expose>",
-        "<Leave>",
-        "<Map>",
-        "<Motion>",
-        "<Reparent>",
-        "<Unmap>",
-        "<Visibility>",
-    )
+##    _tk_events = (
+##        "<Activate>",
+##        "<Circulate>",
+##        "<Configure>",
+##        "<Colormap>",
+##        "<Deactivate>",
+##        "<FocusIn>",
+##        "<FocusOut>",
+##        "<Gravity>",
+##        "<Key>",
+##        "<KeyPress>",
+##        "<KeyRelease>",
+##        "<MouseWheel>",
+##        "<Property>",
+##    )
+##
+##    _other_events = (
+##        "<Button>",
+##        "<ButtonPress>",
+##        "<ButtonRelease>",
+##        "<Enter>",
+##        "<Expose>",
+##        "<Leave>",
+##        "<Map>",
+##        "<Motion>",
+##        "<Reparent>",
+##        "<Unmap>",
+##        "<Visibility>",
+##    )
 
 
     def _make_kernel_runtime(kernel):
@@ -86,8 +84,7 @@ class Kernel(CurioKernel):
         tasks = kernel._tasks
 
         # Internal kernel state
-        event_queue = deque()
-        event_wait = SchedBarrier()
+        event_waiters = {}
         ready = deque()
         sleepq = TimeQueue()
         wake_queue = deque()
@@ -106,12 +103,6 @@ class Kernel(CurioKernel):
         ready_append = ready.append
         ready_popleft = ready.popleft
 
-        event_queue_append = event_queue.append
-        event_queue_popleft = event_queue.popleft
-
-        event_wait_add = event_wait.add
-        event_wait_pop = event_wait.pop
-
 
         # --- Future processing ---
 
@@ -129,7 +120,7 @@ class Kernel(CurioKernel):
                     wait_sock.recv(1000)
                 except BlockingIOError:
                     # This may raise an error as the 1 ms delay in
-                    # tkinter's loop could cause the read to fail. 
+                    # tkinter's loop could cause the read to fail.
                     pass
 
                 while wake_queue:
@@ -234,7 +225,132 @@ class Kernel(CurioKernel):
                 )
 
 
-        # --- Trap decorators ---
+        # --- Event helpers ---
+
+        def add_waiters(events):
+            if events._waiting:
+                raise EventResourceBusy(f"Multiple tasks can't wait on the same event queue {events}")
+
+            for widget, name in events._waiters:
+                is_event = name.startswith("<")
+                if not is_event:
+                    while widget.master and not hasattr(widget, "protocol"):
+                        widget = widget.master
+                key = (widget, name)
+
+                if key in event_waiters:
+                    events_set = event_waiters[key][1]
+                    events_set.add(events)
+
+                else:
+                    events_set = {events}
+                    callback = send_event(widget, name, events_set)
+                    if is_event:
+                        bindid = widget.bind(name, callback, "+")
+                    else:
+                        widget.protocol(name, callback)
+                        bindid = None
+                    event_waiters[key] = (bindid, events_set)
+
+        def remove_waiters(events):
+
+            for widget, name in events._waiters:
+                is_event = name.startswith("<")
+                if not is_event:
+                    while widget.master and not hasattr(widget, "protocol"):
+                        widget = widget.master
+                key = (widget, name)
+
+                if not is_event and widget is toplevel and name == "WM_DELETE_WINDOW":
+                    continue
+
+                if key in event_waiters:
+                    bindid, events_set = event_waiters[key]
+                    events_set.remove(events)
+                    if exists(widget):
+                        if is_event:
+                            widget.unbind(name, bindid)
+                        else:
+                            widget.protocol(name, lambda: None)
+                    del event_waiters[key]
+
+
+        # --- Tkinter callback decorator ---
+
+        # Decorator to hide exceptions for tkinter callbacks
+        def callback(func):
+            @wraps(func)
+            def _wrapper(*args):
+                try:
+                    func(*args)
+                except BaseException as e:
+                    loop.throw(e)
+                else:
+                    return # "break"
+            return _wrapper
+
+
+        # --- Tkinter callbacks ---
+
+        # Factory for event callbacks
+        def send_event(widget, name, events_set):
+            @callback
+            def _event_callback(event=None):
+                for events in events_set:
+                    if name.startswith("<"):
+                        events._events.append(event)
+                    else:
+                        events._events.append(ProtocolEvent(name, monotonic(), widget))
+
+                if not loop.running:
+                    for events in list(events_set):
+                        if events._waiting:
+                            reschedule(events._waiting)
+                            events._waiting = None
+                        remove_waiters(events)
+
+                loop.send("EVENT_WAKE")
+
+            return _event_callback
+
+        # Factory for WM_DELETE_WINDOW protocol callbacks
+        def close_window(widget, name, events_set):
+            _last_close = None
+
+            @callback
+            def _event_callback():
+                nonlocal _last_close
+                if not events_set:
+                    if not loop.closed:
+                        loop.throw(RuntimeError("Toplevel was closed"))
+                    else:
+                        kernel._shutdown_funcs = None
+                        stack.close()
+                    return
+
+                now = monotonic()
+                if _last_close and _last_close + 0.5 > now:
+                    loop.throw(RuntimeError("Kernel was force closed"))
+                    return
+                else:
+                    _last_close = now
+
+                for events in events_set:
+                    events._events.append(ProtocolEvent(name, monotonic(), widget))
+
+                if not loop.running:
+                    for events in list(events_set):
+                        if events._waiting:
+                            reschedule(events._waiting)
+                            events._waiting = None
+                        remove_waiters(events)
+
+                loop.send("EVENT_WAKE")
+
+            return _event_callback
+
+
+        # --- Trap decorator ---
 
         def blocking(func):
             @wraps(func)
@@ -246,15 +362,6 @@ class Kernel(CurioKernel):
                 else:
                     return func(*args)
             return _wrapper
-
-        def event(func):
-            @wraps(func)
-            def _wrapped(*args):
-                if not current.is_event:
-                    return TaskNotEvent("Non-event task cannot access events")
-                else:
-                    return func(*args)
-            return _wrapped
 
 
         # --- Traps ---
@@ -290,10 +397,9 @@ class Kernel(CurioKernel):
             if event:
                 event.set()
 
-            _cancel = (
-                lambda task=current:
-                (future.cancel(), setattr(task, "future", None))
-            )
+            def _cancel(*, task=current):
+                future.cancel()
+                task.future = None
 
             suspend("FUTURE_WAIT", _cancel)
 
@@ -313,10 +419,10 @@ class Kernel(CurioKernel):
 
         @blocking
         def trap_sched_wait(sched, state):
-            suspend(state, sched.add(current))
+            suspend(state, sched._kernel_suspend(current))
 
         def trap_sched_wake(sched, n):
-            tasks = sched.pop(n)
+            tasks = sched._kernel_wake(n)
             for task in tasks:
                 reschedule(task)
 
@@ -335,54 +441,44 @@ class Kernel(CurioKernel):
                 clock += monotonic()
             set_timeout(clock, "sleep")
 
-            _cancel = (
-                lambda task=current:
-                (
-                    sleepq.cancel((task.id, "sleep"), task.sleep),
-                    setattr(task, "sleep", None),
-                )
-            )
+            def _cancel(*, task=current):
+                sleepq.cancel((task.id, "sleep"), task.sleep)
+                task.sleep = None
 
             suspend("TIME_SLEEP", _cancel)
 
         def trap_set_timeout(timeout):
             old_timeout = current.timeout
-
             if timeout is not None:
                 set_timeout(timeout, "timeout")
-
                 if old_timeout and current.timeout > old_timeout:
                     current.timeout = old_timeout
-
             return old_timeout
 
         def trap_unset_timeout(previous):
             now = monotonic()
             set_timeout(None, "timeout")
             set_timeout(previous, "timeout")
-
             if not previous or previous >= now:
                 current.timeout = previous
                 if isinstance(current.cancel_pending, TaskTimeout):
                     current.cancel_pending = None
-
             return now
 
-        @event
-        def trap_pop_event():
-            try:
-                event = event_queue[current._next_event]
-            except IndexError:
-                return NoEvent("No event available")
-            else:
-                current._next_event += 1
-                return event
-
         @blocking
-        @event
-        def trap_wait_event():
-            if current._next_event >= len(event_queue):
-                suspend("EVENT_WAIT", event_wait.add(current))
+        def trap_event_wait(events):
+            try:
+                add_waiters(events)
+            except GuioError as e:
+                return e
+            else:
+                events._waiting = current
+
+            def _cancel():
+                events._waiting = None
+                remove_waiters(events)
+
+            suspend("EVENT_WAIT", _cancel)
 
         def trap_get_kernel():
             return kernel
@@ -392,80 +488,6 @@ class Kernel(CurioKernel):
 
         def trap_get_toplevel():
             return toplevel
-
-
-        # --- Tkinter helpers ---
-
-        @contextmanager
-        def bind(widget, func, events):
-            widget_bind = widget.bind
-            widget_unbind = widget.unbind
-            bindings = [(event, widget_bind(event, func, "+")) for event in events]
-            try:
-                yield bindings
-            finally:
-                if exists(widget):
-                    for info in bindings:
-                        widget_unbind(*info)
-
-        @contextmanager
-        def protocol(toplevel, func):
-            toplevel.protocol("WM_DELETE_WINDOW", func)
-            try:
-                yield
-            finally:
-                if exists(toplevel):
-                    toplevel.protocol("WM_DELETE_WINDOW", toplevel.destroy)
-
-
-        # --- Tkinter callback decorator ---
-
-        # Decorator to return "break" for tkinter callbacks
-        def callback(func):
-            @wraps(func)
-            def _wrapper(*args):
-                func(*args)
-                return "break"
-
-            return _wrapper
-
-
-        # --- Tkinter callbacks ---
-
-        # Functions for event callbacks
-        @callback
-        def send_tk_event(event):
-            if event.widget is toplevel:
-                event_queue_append(event)
-                if event_wait:
-                    loop.send("EVENT_WAKE")
-
-        @callback
-        def send_other_event(event):
-            if event.widget is not toplevel:
-                event_queue_append(event)
-                if event_wait:
-                    loop.send("EVENT_WAKE")
-
-        @callback
-        def send_destroy_event(event):
-            if event.widget is toplevel:
-                event_queue_append(event)
-                if event_wait:
-                    loop.send("EVENT_WAKE")
-
-        _last_close = None
-        @callback
-        def close_window():
-            nonlocal _last_close
-            event_queue_append(CloseWindow("X was pressed"))
-            now = monotonic()
-            if _last_close and _last_close + 0.5 > now:
-                loop.throw(RuntimeError("Kernel was force closed"))
-            else:
-                if event_wait:
-                    loop.send("EVENT_WAKE")
-                _last_close = now
 
 
         # --- Final setup ---
@@ -491,11 +513,12 @@ class Kernel(CurioKernel):
             act.activate(kernel)
 
         # Toplevel creation
-        toplevel = stack.enter_context(destroying(tkinter.Tk()))
-        stack.enter_context(bind(toplevel, send_tk_event, kernel._tk_events))
-        stack.enter_context(bind(toplevel, send_other_event, kernel._other_events))
-        stack.enter_context(bind(toplevel, send_destroy_event, ("<Destroy>",)))
-        stack.enter_context(protocol(toplevel, close_window))
+        kernel._toplevel = toplevel = stack.enter_context(destroying(tkinter.Tk()))
+
+        # Bind toplevel "X" button
+        events_set = set()
+        toplevel.protocol("WM_DELETE_WINDOW", close_window(toplevel, "WM_DELETE_WINDOW", events_set))
+        event_waiters[(toplevel, "WM_DELETE_WINDOW")] = (None, events_set)
 
 
         # --- Tkinter loop (run using tkinter's mainloop) ---
@@ -512,12 +535,7 @@ class Kernel(CurioKernel):
             nonlocal current, running
 
             # Setup main task
-            if coro:
-                main_task = new_task(coro)
-                main_task.report_crash = False
-                main_task.is_event = True
-            else:
-                main_task = None
+            main_task = (new_task(coro) if coro else None)
             del coro
 
 
@@ -599,40 +617,6 @@ class Kernel(CurioKernel):
                     if timeout is not None:
                         frame.after_cancel(id_)
 
-                if data == "EVENT_WAKE":
-                    for task in event_wait.pop(len(event_wait)):
-                        reschedule(task)
-
-
-                # --- Run event clearer (event garbage collection :P) ---
-
-                event_tasks = {task for task in tasks.values() if task.is_event}
-
-                # Check that there are event tasks and offset is
-                # non-zero
-                if event_tasks:
-                    min_offset = min(task._next_event for task in event_tasks)
-                    if min_offset:
-                        for _ in range(min_offset):
-                            event_queue.popleft()
-                        for task in tasks.values():
-                            if task.is_event:
-                                task._next_event -= min_offset
-                            else:
-                                task._next_event = min(-1, task._next_event + min_offset)
-
-                # Clear the queue if there aren't any tasks to collect
-                # events. Note that this will leave at most 50 events on
-                # the queue.
-                elif len(event_queue) > 50:
-
-                    # Leave 25 so that this doesn't run everytime a new
-                    # event is added and the length pops over 50.
-                    event_offset = len(event_queue) - 25
-                    logger.info("Clearing %s events from event queue", event_offset)
-                    for _ in range(event_offset):
-                        event_queue.popleft()
-
 
                 # --- Timeout handling ---
 
@@ -672,7 +656,7 @@ class Kernel(CurioKernel):
 
                         except BaseException as e:
                             # Wake joining tasks
-                            for wtask in current.joining.pop(len(current.joining)):
+                            for wtask in current.joining._kernel_wake(len(current.joining)):
                                 reschedule(wtask)
                             current.terminated = True
                             current.state = "TERMINATED"
@@ -684,7 +668,7 @@ class Kernel(CurioKernel):
                                 current.result = e.value
                             else:
                                 current.exception = e
-                                if current.report_crash and not isinstance(e, (CancelledError, SystemExit)):
+                                if (current != main_task and not isinstance(e, (CancelledError, SystemExit))):
                                     logger.error("Task Crash: %r", current, exc_info=True)
                                 if not isinstance(e, Exception):
                                     raise
@@ -816,17 +800,20 @@ class _GenWrapper:
             # Reschedule if called from within itself
             if self.running:
                 self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
+                return False
 
             # Only run if `gen` isn't closed
-            elif not self.closed:
+            if not self.closed:
                 try:
-                    return func(self._gen, *args, **kwargs)
+                    func(self._gen, *args, **kwargs)
                 except BaseException as e:
                     if isinstance(e, StopIteration):
                         self.result = e.value
                     else:
                         self.exception = e
                     destroy(self._frame)
+
+            return True
 
         return _wrapper
 
