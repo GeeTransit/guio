@@ -9,12 +9,16 @@ import tkinter
 import guio
 
 async def main():
-    toplevel = await guio.current_toplevel()
-    canvas = tkinter.Canvas(toplevel, highlightthickness=0)
+    # Create canvas in a familiar way
+    root = await guio.current_toplevel()
+    canvas = tkinter.Canvas(root, highlightthickness=0)
     canvas.pack(expand=True, fill=tkinter.BOTH)
 
-    events = guio.Events()
+    # Get events from canvas
+    events = guio.Events.from_events(canvas, guio.Events._names)
     async for event in events:
+    
+        # Event responding
         event_type = str(event.type)
         if event.type == "WM_DELETE_WINDOW":
             break
@@ -22,6 +26,7 @@ async def main():
             x, y = event.x, event.y
             canvas.create_oval(x-3, y-3, x+3, y+3, fill="black")
 
+# Simple running of programs
 guio.run(main)
 ```
 
