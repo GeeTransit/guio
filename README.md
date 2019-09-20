@@ -13,14 +13,13 @@ async def main():
     canvas = tkinter.Canvas(toplevel, highlightthickness=0)
     canvas.pack(expand=True, fill=tkinter.BOTH)
 
-    try:
-        async for event in guio.aevents():
-            if event.type in {tkinter.EventType.Motion, tkinter.EventType.Enter}:
-                x, y = event.x, event.y
-                canvas.create_oval(x-3, y-3, x+3, y+3, fill="black")
-
-    except guio.CloseWindow:
-        pass
+    events = guio.Events()
+    async for event in events:
+        if event.type == "WM_DELETE_WINDOW":
+            break
+        elif event.type in {tkinter.EventType.Motion, tkinter.EventType.Enter}:
+            x, y = event.x, event.y
+            canvas.create_oval(x-3, y-3, x+3, y+3, fill="black")
 
 guio.run(main)
 ```
