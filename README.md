@@ -15,9 +15,10 @@ async def main():
 
     events = guio.Events()
     async for event in events:
+        event_type = str(event.type)
         if event.type == "WM_DELETE_WINDOW":
             break
-        elif event.type in {tkinter.EventType.Motion, tkinter.EventType.Enter}:
+        elif event.type in {"Motion", "Enter"}:
             x, y = event.x, event.y
             canvas.create_oval(x-3, y-3, x+3, y+3, fill="black")
 
