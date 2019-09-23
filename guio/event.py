@@ -1,77 +1,57 @@
 from collections import deque
+from contextlib import asynccontextmanager
 
-from curio.sched import SchedBarrier
+from curio.task import spawn
 
-from .errors import *
 from .task import current_toplevel
 from .traps import *
 
 
-__all__ = ["ProtocolEvent", "Events"]
+__all__ = [
+    "EVENT_ALL", "EVENT_KEY", "EVENT_BUTTON", "EVENT_MOTION",
+    "PROT_DELETE", "Events",
+]
 
 
-class ProtocolEvent:
+EVENT_ALL = frozenset({
+    '<Activate>',
+    '<ButtonPress>',
+    '<ButtonRelease>',
+    '<Circulate>',
+    '<Colormap>',
+    '<Configure>',
+    '<Deactivate>',
+    '<Enter>',
+    '<Expose>',
+    '<FocusIn>',
+    '<FocusOut>',
+    '<Gravity>',
+    '<KeyPress>',
+    '<KeyRelease>',
+    '<Leave>',
+    '<Map>',
+    '<Motion>',
+    '<MouseWheel>',
+    '<Property>',
+    '<Reparent>',
+    '<Unmap>',
+    '<Visibility>',
+    "WM_DELETE_WINDOW",
+})
 
-    def __init__(self, type_, time, widget):
-        self.type = type_
-        self.time = time
-        self.widget = widget
+EVENT_KEY = frozenset({'<KeyPress>', '<KeyRelease>'})
+EVENT_BUTTON = frozenset({'<ButtonPress>', '<ButtonRelease>'})
+EVENT_MOTION = frozenset({'<Enter>', '<Motion>', '<Leave>'})
+PROT_DELETE = frozenset({"WM_DELETE_WINDOW"})
 
 
 class Events:
 
-    _names = (
-        '<Activate>',
-        '<Button>',
-        '<ButtonPress>',
-        '<ButtonRelease>',
-        '<Circulate>',
-        '<Colormap>',
-        '<Configure>',
-        '<Deactivate>',
-        '<Enter>',
-        '<Expose>',
-        '<FocusIn>',
-        '<FocusOut>',
-        '<Gravity>',
-        '<Key>',
-        '<KeyPress>',
-        '<KeyRelease>',
-        '<Leave>',
-        '<Map>',
-        '<Motion>',
-        '<MouseWheel>',
-        '<Property>',
-        '<Reparent>',
-        '<Unmap>',
-        '<Visibility>',
-        "WM_DELETE_WINDOW",
-    )
-
-    def __init__(self, waiters=(), *, blocking=True):
+    def __init__(self, waiters, *, blocking=True):
         self.blocking = blocking
         self._waiters = waiters
         self._events = deque()
         self._waiting = None
-
-    @classmethod
-    def from_events(cls, widget, names, **kwargs):
-        waiters = ((widget, name) for name in names)
-        return cls(tuple(waiters), **kwargs)
-
-    @classmethod
-    def from_pairs(cls, *pairs, **kwargs):
-        waiters = ((widget, name) for widget, names in pairs for name in names)
-        return cls(tuple(waiters), **kwargs)
-
-    @classmethod
-    def from_dict(cls, waiters, **kwargs):
-        waiters = (
-            (widget, name)
-            for widget, names in waiters.items()
-            for name in names
-        )
-        return cls(tuple(waiters), **kwargs)
 
     def __repr__(self):
         return f"<{type(self).__name__} waiting={self._waiting!r}>"
@@ -81,11 +61,16 @@ class Events:
 
     async def __anext__(self):
         try:
-            return await self.pop(blocking=self.blocking)
+            return await self.pop()
         except IndexError:
             raise StopAsyncIteration from None
 
-    async def pop(self, *, blocking=True):
+    async def wait(self):
+        await _event_wait(self)
+
+    async def pop(self, *, blocking=None):
+        if blocking is None:
+            blocking = self.blocking
         if not blocking:
             return self._events.popleft()
         while True:
@@ -93,6 +78,3 @@ class Events:
                 return self._events.popleft()
             except IndexError:
                 await self.wait()
-
-    async def wait(self):
-        await _event_wait(self)

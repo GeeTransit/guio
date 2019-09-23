@@ -12,13 +12,11 @@ from time import monotonic
 
 from curio.errors import *
 from curio.kernel import run as curio_run, Kernel as CurioKernel
-from curio.sched import SchedBarrier
 from curio.task import Task
 from curio.timequeue import TimeQueue
 from curio.traps import _read_wait
 
 from .errors import *
-from .event import ProtocolEvent
 from .utilities import *
 
 
@@ -30,37 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class Kernel(CurioKernel):
-
-##    _tk_events = (
-##        "<Activate>",
-##        "<Circulate>",
-##        "<Configure>",
-##        "<Colormap>",
-##        "<Deactivate>",
-##        "<FocusIn>",
-##        "<FocusOut>",
-##        "<Gravity>",
-##        "<Key>",
-##        "<KeyPress>",
-##        "<KeyRelease>",
-##        "<MouseWheel>",
-##        "<Property>",
-##    )
-##
-##    _other_events = (
-##        "<Button>",
-##        "<ButtonPress>",
-##        "<ButtonRelease>",
-##        "<Enter>",
-##        "<Expose>",
-##        "<Leave>",
-##        "<Map>",
-##        "<Motion>",
-##        "<Reparent>",
-##        "<Unmap>",
-##        "<Visibility>",
-##    )
-
 
     def _make_kernel_runtime(kernel):
 
@@ -227,52 +194,73 @@ class Kernel(CurioKernel):
 
         # --- Event helpers ---
 
+        def new_protocol_event(widget, name, tm):
+            event = tkinter.Event()
+            event.time = int(tm*1000)
+            event.type = name
+            event.widget = widget
+            event.char = "??"
+            event.delta = 0
+            event.height = "??"
+            event.keycode = "??"
+            event.keysym = "??"
+            event.keysym_num = "??"
+            event.num = "??"
+            event.serial = "??"
+            event.state = "??"
+            event.width = "??"
+            event.x = "??"
+            event.y = "??"
+            event.x_root = "??"
+            event.y_root = "??"
+            return event
+
         def add_waiters(events):
             if events._waiting:
                 raise EventResourceBusy(f"Multiple tasks can't wait on the same event queue {events}")
 
-            for widget, name in events._waiters:
-                is_event = name.startswith("<")
-                if not is_event:
-                    while widget.master and not hasattr(widget, "protocol"):
-                        widget = widget.master
-                key = (widget, name)
+            for widget, names in events._waiters.items():
+                for name in names:
+                    is_event = name.startswith("<")
+                    if not is_event:
+                        while widget.master and not hasattr(widget, "protocol"):
+                            widget = widget.master
 
-                if key in event_waiters:
-                    events_set = event_waiters[key][1]
-                    events_set.add(events)
+                    key = (widget, name)
+                    if key in event_waiters:
+                        events_set = event_waiters[key][1]
+                        events_set.add(events)
 
-                else:
-                    events_set = {events}
-                    callback = send_event(widget, name, events_set)
-                    if is_event:
-                        bindid = widget.bind(name, callback, "+")
                     else:
-                        widget.protocol(name, callback)
-                        bindid = None
-                    event_waiters[key] = (bindid, events_set)
+                        events_set = {events}
+                        callback = send_event(widget, name, events_set)
+                        if is_event:
+                            bindid = widget.bind(name, callback, "+")
+                        else:
+                            widget.protocol(name, callback)
+                            bindid = None
+                        event_waiters[key] = (bindid, events_set)
 
         def remove_waiters(events):
+            for widget, names in events._waiters.items():
+                for name in names:
+                    is_event = name.startswith("<")
+                    if not is_event:
+                        while widget.master and not hasattr(widget, "protocol"):
+                            widget = widget.master
+                    if not is_event and widget is toplevel and name == "WM_DELETE_WINDOW":
+                        continue
 
-            for widget, name in events._waiters:
-                is_event = name.startswith("<")
-                if not is_event:
-                    while widget.master and not hasattr(widget, "protocol"):
-                        widget = widget.master
-                key = (widget, name)
-
-                if not is_event and widget is toplevel and name == "WM_DELETE_WINDOW":
-                    continue
-
-                if key in event_waiters:
-                    bindid, events_set = event_waiters[key]
-                    events_set.remove(events)
-                    if exists(widget):
-                        if is_event:
-                            widget.unbind(name, bindid)
-                        else:
-                            widget.protocol(name, lambda: None)
-                    del event_waiters[key]
+                    key = (widget, name)
+                    if key in event_waiters:
+                        bindid, events_set = event_waiters[key]
+                        events_set.remove(events)
+                        if exists(widget):
+                            if is_event:
+                                widget.unbind(name, bindid)
+                            else:
+                                widget.protocol(name, lambda: None)
+                        del event_waiters[key]
 
 
         # --- Tkinter callback decorator ---
@@ -296,11 +284,10 @@ class Kernel(CurioKernel):
         def send_event(widget, name, events_set):
             @callback
             def _event_callback(event=None):
+                if event is None:
+                    event = new_protocol_event(widget, name, monotonic())
                 for events in events_set:
-                    if name.startswith("<"):
-                        events._events.append(event)
-                    else:
-                        events._events.append(ProtocolEvent(name, monotonic(), widget))
+                    events._events.append(event)
 
                 if not loop.running:
                     for events in list(events_set):
@@ -320,12 +307,13 @@ class Kernel(CurioKernel):
             @callback
             def _event_callback():
                 nonlocal _last_close
+                if loop.closed:
+                    kernel._shutdown_funcs = None
+                    stack.close()
+                    return
+
                 if not events_set:
-                    if not loop.closed:
-                        loop.throw(RuntimeError("Toplevel was closed"))
-                    else:
-                        kernel._shutdown_funcs = None
-                        stack.close()
+                    loop.throw(RuntimeError("Toplevel was closed"))
                     return
 
                 now = monotonic()
@@ -335,8 +323,9 @@ class Kernel(CurioKernel):
                 else:
                     _last_close = now
 
+                event = new_protocol_event(widget, name, monotonic())
                 for events in events_set:
-                    events._events.append(ProtocolEvent(name, monotonic(), widget))
+                    events._events.append(event)
 
                 if not loop.running:
                     for events in list(events_set):
