@@ -15,9 +15,9 @@ async def main():
     canvas.pack(expand=True, fill=tkinter.BOTH)
 
     # Get events from canvas
-    events = guio.Events.from_events(canvas, guio.Events._names)
+    events = guio.Events({canvas: guio.EVENT_ALL})
     async for event in events:
-    
+
         # Event responding
         event_type = str(event.type)
         if event.type == "WM_DELETE_WINDOW":
