@@ -11,7 +11,7 @@ from socket import socketpair
 from time import monotonic
 
 from curio.errors import *
-from curio.kernel import run as curio_run, Kernel as CurioKernel
+from curio.kernel import run as _run, Kernel as _Kernel
 from curio.task import Task
 from curio.timequeue import TimeQueue
 from curio.traps import _read_wait
@@ -26,8 +26,21 @@ __all__ = ["Kernel", "run"]
 logger = logging.getLogger(__name__)
 
 
+class Kernel(_Kernel):
 
-class Kernel(CurioKernel):
+    def __init__(self, *, selector=None, debug=None, activations=None, toplevel=None):
+        super().__init__(selector=selector, debug=debug, activations=activations)
+
+        if toplevel is None:
+            toplevel = tkinter.Tk()
+        self._toplevel = toplevel
+        self._call_at_shutdown(lambda: destroy(self._toplevel))
+
+        def _close_window():
+            self._shutdown_funcs = None
+            toplevel.destroy()
+        toplevel.protocol("WM_DELETE_WINDOW", _close_window)
+
 
     def _make_kernel_runtime(kernel):
 
@@ -37,11 +50,6 @@ class Kernel(CurioKernel):
         current = None
         running = False
 
-        # Toplevel and outer stack
-        toplevel = None
-        stack = ExitStack()
-        kernel._call_at_shutdown(stack.close)
-
         # Inner loop and dummy frame (tkinter loop)
         loop = None
         frame = None
@@ -49,6 +57,7 @@ class Kernel(CurioKernel):
         # Restore kernel attributes
         selector = kernel._selector
         tasks = kernel._tasks
+        toplevel = kernel._toplevel
 
         # Internal kernel state
         event_waiters = {}
@@ -77,7 +86,7 @@ class Kernel(CurioKernel):
         notify_sock = None
         wait_sock = None
 
-        async def kernel_task():
+        async def _kernel_task():
             wake_queue_popleft = wake_queue.popleft
 
             while True:
@@ -95,7 +104,7 @@ class Kernel(CurioKernel):
                     if future and task.future is not future:
                         continue
                     task.future = None
-                    reschedule(task)
+                    reschedule_task(task)
 
         def wake(task=None, future=None):
             if task:
@@ -113,27 +122,25 @@ class Kernel(CurioKernel):
 
         # --- Task helpers ---
 
-        def reschedule(task, val=None):
+        def reschedule_task(task, val=None):
             ready_append(task)
             task.state = "READY"
             task.cancel_func = None
             task._trap_result = val
 
-        def suspend(state, cancel_func):
+        def suspend_task(state, cancel_func):
             nonlocal running
             current.state = state
             current.cancel_func = cancel_func
-
             if current._last_io:
                 unregister_event(*current._last_io)
                 current._last_io = None
-
             running = None
 
         def new_task(coro):
             task = Task(coro)
             tasks[task.id] = task
-            reschedule(task)
+            reschedule_task(task)
             for a in _activations:
                 a.created(task)
             return task
@@ -141,7 +148,7 @@ class Kernel(CurioKernel):
         def cancel_task(task, exc):
             if task.allow_cancel and task.cancel_func:
                 task.cancel_func()
-                reschedule(task, exc)
+                reschedule_task(task, exc)
             else:
                 task.cancel_pending = exc
 
@@ -158,13 +165,12 @@ class Kernel(CurioKernel):
         def register_event(fileobj, event, task):
             try:
                 key = selector_getkey(fileobj)
-
             except KeyError:
-                selector_register(
-                    fileobj, event,
-                    ((task, None) if event == EVENT_READ else (None, task)),
-                )
-
+                if event == EVENT_READ:
+                    data = (task, None)
+                else:
+                    data = (None, task)
+                selector_register(fileobj, event, data)
             else:
                 mask = key.events
                 rtask, wtask = key.data
@@ -172,11 +178,11 @@ class Kernel(CurioKernel):
                     raise ReadResourceBusy(f"Multiple tasks can't wait to read on the same file descriptor {fileobj!r}")
                 if event == EVENT_WRITE and wtask:
                     raise WriteResourceBusy(f"Multiple tasks can't wait to write on the same file descriptor {fileobj!r}")
-
-                selector_modify(
-                    fileobj, mask | event,
-                    ((task, wtask) if event == EVENT_READ else (rtask, task)),
-                )
+                if event == EVENT_READ:
+                    data = (task, wtask)
+                else:
+                    data = (rtask, task)
+                selector_modify(fileobj, mask | event, data)
 
         def unregister_event(fileobj, event):
             key = selector_getkey(fileobj)
@@ -186,14 +192,16 @@ class Kernel(CurioKernel):
             if not mask:
                 selector_unregister(fileobj)
             else:
-                selector_modify(
-                    fileobj, mask,
-                    ((None, wtask) if event == EVENT_READ else (rtask, None)),
-                )
+                if event == EVENT_READ:
+                    data = (None, wtask)
+                else:
+                    data = (rtask, None)
+                selector_modify(fileobj, mask, data)
 
 
         # --- Event helpers ---
 
+        # Create a new tkinter.Event instance but for a protocol event
         def new_protocol_event(widget, name, tm):
             event = tkinter.Event()
             event.time = int(tm*1000)
@@ -215,6 +223,7 @@ class Kernel(CurioKernel):
             event.y_root = "??"
             return event
 
+        # Add to event waiters and bind if new
         def add_waiters(events):
             if events._waiting:
                 raise EventResourceBusy(f"Multiple tasks can't wait on the same event queue {events}")
@@ -230,17 +239,18 @@ class Kernel(CurioKernel):
                     if key in event_waiters:
                         events_set = event_waiters[key][1]
                         events_set.add(events)
+                        continue
 
+                    events_set = {events}
+                    callback = send_event(widget, name, events_set)
+                    if is_event:
+                        bindid = widget.bind(name, callback, "+")
                     else:
-                        events_set = {events}
-                        callback = send_event(widget, name, events_set)
-                        if is_event:
-                            bindid = widget.bind(name, callback, "+")
-                        else:
-                            widget.protocol(name, callback)
-                            bindid = None
-                        event_waiters[key] = (bindid, events_set)
+                        widget.protocol(name, callback)
+                        bindid = None
+                    event_waiters[key] = (bindid, events_set)
 
+        # Remove from events waiters and unbind if empty
         def remove_waiters(events):
             for widget, names in events._waiters.items():
                 for name in names:
@@ -248,19 +258,24 @@ class Kernel(CurioKernel):
                     if not is_event:
                         while widget.master and not hasattr(widget, "protocol"):
                             widget = widget.master
-                    if not is_event and widget is toplevel and name == "WM_DELETE_WINDOW":
-                        continue
 
                     key = (widget, name)
-                    if key in event_waiters:
-                        bindid, events_set = event_waiters[key]
-                        events_set.remove(events)
-                        if exists(widget):
-                            if is_event:
-                                widget.unbind(name, bindid)
-                            else:
-                                widget.protocol(name, lambda: None)
-                        del event_waiters[key]
+                    assert key in event_waiters
+                    bindid, events_set = event_waiters[key]
+                    events_set.remove(events)
+
+                    if events_set:
+                        continue
+
+                    if widget is toplevel and name == "WM_DELETE_WINDOW":
+                        continue
+
+                    if exists(widget):
+                        if is_event:
+                            widget.unbind(name, bindid)
+                        else:
+                            widget.protocol(name, lambda: None)
+                    del event_waiters[key]
 
 
         # --- Tkinter callback decorator ---
@@ -292,7 +307,7 @@ class Kernel(CurioKernel):
                 if not loop.running:
                     for events in list(events_set):
                         if events._waiting:
-                            reschedule(events._waiting)
+                            reschedule_task(events._waiting)
                             events._waiting = None
                         remove_waiters(events)
 
@@ -309,17 +324,15 @@ class Kernel(CurioKernel):
                 nonlocal _last_close
                 if loop.closed:
                     kernel._shutdown_funcs = None
-                    stack.close()
+                    destroy(toplevel)
                     return
 
                 if not events_set:
-                    loop.throw(RuntimeError("Toplevel was closed"))
-                    return
+                    raise RuntimeError("Toplevel was closed")
 
                 now = monotonic()
                 if _last_close and _last_close + 0.5 > now:
-                    loop.throw(RuntimeError("Kernel was force closed"))
-                    return
+                    raise RuntimeError("Kernel was force closed")
                 else:
                     _last_close = now
 
@@ -330,7 +343,7 @@ class Kernel(CurioKernel):
                 if not loop.running:
                     for events in list(events_set):
                         if events._waiting:
-                            reschedule(events._waiting)
+                            reschedule_task(events._waiting)
                             events._waiting = None
                         remove_waiters(events)
 
@@ -364,9 +377,8 @@ class Kernel(CurioKernel):
                     register_event(fileobj, event, current)
                 except CurioError as e:
                     return e
-
             current._last_io = None
-            suspend(state, lambda: unregister_event(fileobj, event))
+            suspend_task(state, lambda: unregister_event(fileobj, event))
 
         def trap_io_waiting(fileobj):
             try:
@@ -385,12 +397,10 @@ class Kernel(CurioKernel):
             future.add_done_callback(lambda fut, task=current: wake(task, fut))
             if event:
                 event.set()
-
             def _cancel(*, task=current):
                 future.cancel()
                 task.future = None
-
-            suspend("FUTURE_WAIT", _cancel)
+            suspend_task("FUTURE_WAIT", _cancel)
 
         def trap_spawn(coro):
             task = new_task(coro)
@@ -408,12 +418,12 @@ class Kernel(CurioKernel):
 
         @blocking
         def trap_sched_wait(sched, state):
-            suspend(state, sched._kernel_suspend(current))
+            suspend_task(state, sched._kernel_suspend(current))
 
         def trap_sched_wake(sched, n):
             tasks = sched._kernel_wake(n)
             for task in tasks:
-                reschedule(task)
+                reschedule_task(task)
 
         def trap_clock():
             return monotonic()
@@ -422,19 +432,16 @@ class Kernel(CurioKernel):
         def trap_sleep(clock, absolute):
             nonlocal running
             if clock == 0:
-                reschedule(current)
+                reschedule_task(current)
                 running = False
                 return
-
             if not absolute:
                 clock += monotonic()
             set_timeout(clock, "sleep")
-
             def _cancel(*, task=current):
                 sleepq.cancel((task.id, "sleep"), task.sleep)
                 task.sleep = None
-
-            suspend("TIME_SLEEP", _cancel)
+            suspend_task("TIME_SLEEP", _cancel)
 
         def trap_set_timeout(timeout):
             old_timeout = current.timeout
@@ -460,14 +467,11 @@ class Kernel(CurioKernel):
                 add_waiters(events)
             except GuioError as e:
                 return e
-            else:
-                events._waiting = current
-
+            events._waiting = current
             def _cancel():
                 events._waiting = None
                 remove_waiters(events)
-
-            suspend("EVENT_WAIT", _cancel)
+            suspend_task("EVENT_WAIT", _cancel)
 
         def trap_get_kernel():
             return kernel
@@ -490,7 +494,7 @@ class Kernel(CurioKernel):
 
         # Loopback sockets
         init_loopback()
-        task = new_task(kernel_task())
+        task = new_task(_kernel_task())
         task.daemon = True
 
         # Activations
@@ -500,9 +504,6 @@ class Kernel(CurioKernel):
         ]
         for act in _activations:
             act.activate(kernel)
-
-        # Toplevel creation
-        kernel._toplevel = toplevel = stack.enter_context(destroying(tkinter.Tk()))
 
         # Bind toplevel "X" button
         events_set = set()
@@ -552,13 +553,13 @@ class Kernel(CurioKernel):
 
                     if mask & EVENT_READ:
                         rtask._last_io = (None if intfd else (key.fileobj, EVENT_READ))
-                        reschedule(rtask)
+                        reschedule_task(rtask)
                         mask &= ~EVENT_READ
                         rtask = None
 
                     if mask & EVENT_WRITE:
                         wtask._last_io = (None if intfd else (key.fileobj, EVENT_WRITE))
-                        reschedule(wtask)
+                        reschedule_task(wtask)
                         mask &= ~EVENT_WRITE
                         wtask = None
 
@@ -621,7 +622,7 @@ class Kernel(CurioKernel):
                     setattr(task, sleep_type, None)
 
                     if sleep_type == "sleep":
-                        reschedule(task, now)
+                        reschedule_task(task, now)
                     else:
                         cancel_task(task, TaskTimeout(now))
 
@@ -646,7 +647,7 @@ class Kernel(CurioKernel):
                         except BaseException as e:
                             # Wake joining tasks
                             for wtask in current.joining._kernel_wake(len(current.joining)):
-                                reschedule(wtask)
+                                reschedule_task(wtask)
                             current.terminated = True
                             current.state = "TERMINATED"
                             del tasks[current.id]
@@ -739,15 +740,23 @@ class Kernel(CurioKernel):
                 # If an exception happened in the loop, the kernel
                 # "crashes" and stops any further attempt to use it.
                 kernel._shutdown_funcs = None
-                stack.close()  # Close the toplevel
                 raise
 
         return _runner
 
 
-@wraps(curio_run)
-def run(corofunc, *args, with_monitor=False, **kernel_kwargs):
-    kernel = Kernel(**kernel_kwargs)
+@wraps(_run)
+def run(
+    corofunc, *args, with_monitor=False, selector=None, debug=None,
+    activations=None, toplevel=None, **kernel_extra
+):
+    kernel = Kernel(
+        selector=selector,
+        debug=debug,
+        activations=activations,
+        toplevel=toplevel,
+        **kernel_extra,
+    )
 
     # Check if a monitor has been requested
     if with_monitor or "CURIOMONITOR" in os.environ:
