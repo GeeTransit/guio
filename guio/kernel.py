@@ -4,14 +4,15 @@ import os
 import tkinter
 
 from collections import deque
-from contextlib import contextmanager, ExitStack
+from contextlib import ExitStack
 from functools import wraps
 from selectors import EVENT_READ, EVENT_WRITE
 from socket import socketpair
 from time import monotonic
 
+from curio.activation import Activation
 from curio.errors import *
-from curio.kernel import run as _run, Kernel as _Kernel
+from curio.kernel import Kernel as _Kernel
 from curio.task import Task
 from curio.timequeue import TimeQueue
 from curio.traps import _read_wait
@@ -27,6 +28,15 @@ logger = logging.getLogger(__name__)
 
 
 class Kernel(_Kernel):
+    """
+    Guio run-time kernel.  The selector argument specifies a different
+    I/O selector. The debug argument specifies a list of debugger
+    objects to apply. The toplevel argument specifies a different
+    tkinter.Tk instance. For example:
+        from curio.debug import schedtrace, traptrace
+        k = Kernel(debug=[schedtrace, traptrace])
+    Use the kernel run() method to submit work to the kernel.
+    """
 
     def __init__(self, *, selector=None, debug=None, activations=None, toplevel=None):
         super().__init__(selector=selector, debug=debug, activations=activations)
@@ -37,8 +47,8 @@ class Kernel(_Kernel):
         self._call_at_shutdown(lambda: destroy(self._toplevel))
 
         def _close_window():
+            destroy(toplevel)
             self._shutdown_funcs = None
-            toplevel.destroy()
         toplevel.protocol("WM_DELETE_WINDOW", _close_window)
 
 
@@ -132,10 +142,12 @@ class Kernel(_Kernel):
             nonlocal running
             current.state = state
             current.cancel_func = cancel_func
+
             if current._last_io:
                 unregister_event(*current._last_io)
                 current._last_io = None
-            running = None
+
+            running = False
 
         def new_task(coro):
             task = Task(coro)
@@ -165,12 +177,14 @@ class Kernel(_Kernel):
         def register_event(fileobj, event, task):
             try:
                 key = selector_getkey(fileobj)
+
             except KeyError:
                 if event == EVENT_READ:
                     data = (task, None)
                 else:
                     data = (None, task)
                 selector_register(fileobj, event, data)
+
             else:
                 mask = key.events
                 rtask, wtask = key.data
@@ -178,6 +192,7 @@ class Kernel(_Kernel):
                     raise ReadResourceBusy(f"Multiple tasks can't wait to read on the same file descriptor {fileobj!r}")
                 if event == EVENT_WRITE and wtask:
                     raise WriteResourceBusy(f"Multiple tasks can't wait to write on the same file descriptor {fileobj!r}")
+
                 if event == EVENT_READ:
                     data = (task, wtask)
                 else:
@@ -207,6 +222,7 @@ class Kernel(_Kernel):
             event.time = int(tm*1000)
             event.type = name
             event.widget = widget
+
             event.char = "??"
             event.delta = 0
             event.height = "??"
@@ -221,6 +237,7 @@ class Kernel(_Kernel):
             event.y = "??"
             event.x_root = "??"
             event.y_root = "??"
+
             return event
 
         # Add to event waiters and bind if new
@@ -323,15 +340,17 @@ class Kernel(_Kernel):
             def _event_callback():
                 nonlocal _last_close
                 if loop.closed:
-                    kernel._shutdown_funcs = None
                     destroy(toplevel)
+                    kernel._shutdown_funcs = None
                     return
 
                 if not events_set:
+                    destroy(toplevel)
                     raise RuntimeError("Toplevel was closed")
 
                 now = monotonic()
                 if _last_close and _last_close + 0.5 > now:
+                    destroy(toplevel)
                     raise RuntimeError("Kernel was force closed")
                 else:
                     _last_close = now
@@ -377,6 +396,7 @@ class Kernel(_Kernel):
                     register_event(fileobj, event, current)
                 except CurioError as e:
                     return e
+
             current._last_io = None
             suspend_task(state, lambda: unregister_event(fileobj, event))
 
@@ -397,6 +417,7 @@ class Kernel(_Kernel):
             future.add_done_callback(lambda fut, task=current: wake(task, fut))
             if event:
                 event.set()
+
             def _cancel(*, task=current):
                 future.cancel()
                 task.future = None
@@ -410,8 +431,10 @@ class Kernel(_Kernel):
         def trap_cancel_task(task, exc=TaskCancelled, val=None):
             if task.cancelled:
                 return
+
             if not isinstance(exc, BaseException):
                 exc = exc(exc.__name__ if val is None else val)
+
             task.cancelled = True
             task.timeout = None
             cancel_task(task, exc)
@@ -435,30 +458,36 @@ class Kernel(_Kernel):
                 reschedule_task(current)
                 running = False
                 return
+
             if not absolute:
                 clock += monotonic()
             set_timeout(clock, "sleep")
+
             def _cancel(*, task=current):
                 sleepq.cancel((task.id, "sleep"), task.sleep)
                 task.sleep = None
             suspend_task("TIME_SLEEP", _cancel)
 
         def trap_set_timeout(timeout):
-            old_timeout = current.timeout
+            previous = current.timeout
             if timeout is not None:
                 set_timeout(timeout, "timeout")
-                if old_timeout and current.timeout > old_timeout:
-                    current.timeout = old_timeout
-            return old_timeout
+
+                if previous and current.timeout > previous:
+                    current.timeout = previous
+
+            return previous
 
         def trap_unset_timeout(previous):
             now = monotonic()
             set_timeout(None, "timeout")
             set_timeout(previous, "timeout")
+
             if not previous or previous >= now:
                 current.timeout = previous
                 if isinstance(current.cancel_pending, TaskTimeout):
                     current.cancel_pending = None
+
             return now
 
         @blocking
@@ -467,7 +496,9 @@ class Kernel(_Kernel):
                 add_waiters(events)
             except GuioError as e:
                 return e
-            events._waiting = current
+            else:
+                events._waiting = current
+
             def _cancel():
                 events._waiting = None
                 remove_waiters(events)
@@ -506,9 +537,9 @@ class Kernel(_Kernel):
             act.activate(kernel)
 
         # Bind toplevel "X" button
-        events_set = set()
-        toplevel.protocol("WM_DELETE_WINDOW", close_window(toplevel, "WM_DELETE_WINDOW", events_set))
-        event_waiters[(toplevel, "WM_DELETE_WINDOW")] = (None, events_set)
+        _events_set = set()
+        toplevel.protocol("WM_DELETE_WINDOW", close_window(toplevel, "WM_DELETE_WINDOW", _events_set))
+        event_waiters[(toplevel, "WM_DELETE_WINDOW")] = (None, _events_set)
 
 
         # --- Tkinter loop (run using tkinter's mainloop) ---
@@ -745,11 +776,22 @@ class Kernel(_Kernel):
         return _runner
 
 
-@wraps(_run)
 def run(
     corofunc, *args, with_monitor=False, selector=None, debug=None,
     activations=None, toplevel=None, **kernel_extra
 ):
+    """
+    Run the guio kernel with an initial task and execute until all tasks
+    terminate.  Returns the task's final result (if any). This is a
+    convenience function that should primarily be used for launching the
+    top-level task of a guio-based application.  It creates an entirely
+    new kernel, runs the given task to completion, and concludes by
+    shutting down the kernel, releasing all resources used.
+    
+    Don't use this function if you're repeatedly launching a lot of
+    new tasks to run in guio. Instead, create a Kernel instance and
+    use its run() method instead.
+    """
     kernel = Kernel(
         selector=selector,
         debug=debug,

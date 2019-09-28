@@ -54,7 +54,8 @@ class Events:
         self._waiting = None
 
     def __repr__(self):
-        return f"<{type(self).__name__} waiting={self._waiting!r}>"
+        waiting = (repr(self._waiting) if self._waiting else "NONE")
+        return f"<{type(self).__name__} waiting={waiting!r}>"
 
     def __aiter__(self):
         return self
