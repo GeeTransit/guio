@@ -2,6 +2,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 
 from curio.task import spawn
+from curio.thread import AWAIT
 
 from .task import current_toplevel
 from .traps import *
@@ -57,15 +58,6 @@ class Events:
         waiting = (repr(self._waiting) if self._waiting else "NONE")
         return f"<{type(self).__name__} waiting={waiting!r}>"
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        try:
-            return await self.pop()
-        except IndexError:
-            raise StopAsyncIteration from None
-
     async def wait(self):
         await _event_wait(self)
 
@@ -79,3 +71,21 @@ class Events:
                 return self._events.popleft()
             except IndexError:
                 await self.wait()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return await self.pop()
+        except IndexError:
+            raise StopAsyncIteration
+
+    def __iter__(self):
+        return AWAIT(self.__aiter__)
+
+    def __next__(self):
+        try:
+            return AWAIT(self.__anext__)
+        except StopAsyncIteration:
+            raise StopIteration
