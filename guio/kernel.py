@@ -4,7 +4,6 @@ import os
 import tkinter
 
 from collections import deque
-from contextlib import ExitStack
 from functools import wraps
 from selectors import EVENT_READ, EVENT_WRITE
 from socket import socketpair
@@ -283,7 +282,6 @@ class Kernel(_Kernel):
 
                     if events_set:
                         continue
-
                     if widget is toplevel and name == "WM_DELETE_WINDOW":
                         continue
 
@@ -547,7 +545,7 @@ class Kernel(_Kernel):
         # gets submitted to the kernel. Shared state is stored outside
         # the inner loop to reduce slowdowns.
 
-        def _inner_loop(coro):
+        def _kernel_loop(coro):
 
 
             # --- Main loop preparation ---
@@ -731,33 +729,45 @@ class Kernel(_Kernel):
 
         # --- Runner function ---
 
-        def _runner(work):
+        def _kernel_run(work):
 
             nonlocal loop, frame
 
             # Receive work and get result
-            inner_loop = _inner_loop(work)
+            kernel_loop = _kernel_loop(work)
             del work
 
-            # Wrap frame and loop in context managers
-            with ExitStack() as inner_stack:
-                frame = inner_stack.enter_context(destroying(tkinter.Frame(toplevel)))
-                loop = inner_stack.enter_context(_GenWrapper(inner_loop, frame))
-                del inner_loop
+            # Wrap loop with a frame
+            frame = tkinter.Frame(toplevel)
+            loop = _GenWrapper(kernel_loop, frame)
 
-                # Run until frame is destroyed. Note that `wait_window`
-                # will spawn in tkinter's event loop but will return
-                # when the widget is destroyed. `frame` will be
-                # destroyed when the loop ends or when an exception
-                # happens while sending a value to the loop.
+            try:
+                # Run until loop's frame is destroyed. Note that
+                # `frame.wait_window` will spawn in tkinter's event loop
+                # but will return when the widget is destroyed. `frame`
+                # will be destroyed when the loop ends or when an
+                # exception happens while sending a value to the loop.
                 loop.send(None)
-                if not loop.closed:
+
+                # Continually recreate new frames to be used as a
+                # spawner for the tkinter's event loop.
+                while not loop.closed:
                     frame.wait_window()
 
-                # Check that the loop closed after `frame` was
-                # destroyed.
-                if not loop.closed:
-                    raise RuntimeError("Frame closed before main task finished")
+                    # Check that the loop closed after `frame` was
+                    # destroyed.
+                    if not loop.closed:
+
+                        # Create new frame :D
+                        loop._frame = frame = tkinter.Frame(toplevel)
+                        loop.send(None)
+
+            finally:
+                # RIP
+                # loop, frame
+                # 2019-2019
+                loop.close()
+                destroy(frame)
 
             try:
                 # Check that toplevel still exists.
@@ -773,7 +783,7 @@ class Kernel(_Kernel):
                 kernel._shutdown_funcs = None
                 raise
 
-        return _runner
+        return _kernel_run
 
 
 def run(
@@ -815,7 +825,9 @@ def run(
 # generator is still running. Note that this doesn't attempt to fulfill
 # the iterator protocol nor the coroutine methods as this is meant for
 # use in tkinter callbacks. Exceptions that go unhandled in tkinter are
-# hardcoded to be printed out; we prevent that from happening here.
+# (basically) hardcoded to be printed out; we prevent that from
+# happening here by wrapping all methods and by raising no exceptions
+# when finished.
 class _GenWrapper:
 
     def __init__(self, gen, frame):
@@ -834,6 +846,8 @@ class _GenWrapper:
         self._gen.close()
 
     def _safe_call(func):
+        # Wrapper function that returns False if rescheduled for later,
+        # True otherwise.
         @wraps(func)
         def _wrapper(self, *args, **kwargs):
 
