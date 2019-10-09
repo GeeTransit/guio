@@ -1,91 +1,213 @@
-from collections import deque
-from contextlib import asynccontextmanager
+import threading
+import tkinter
+import weakref
 
-from curio.task import spawn
-from curio.thread import AWAIT
+from collections import Counter, defaultdict
+from time import monotonic
 
-from .task import current_toplevel
-from .traps import *
+from curio.queue import UniversalQueue
+from curio.sync import UniversalEvent
 
 
 __all__ = [
     "EVENT_ALL", "EVENT_KEY", "EVENT_BUTTON", "EVENT_MOTION",
-    "PROT_DELETE", "Events",
+    "PROT_DELETE", "EventQueue", "EventWaiter",
 ]
 
 
 EVENT_ALL = frozenset({
-    '<Activate>',
-    '<ButtonPress>',
-    '<ButtonRelease>',
-    '<Circulate>',
-    '<Colormap>',
-    '<Configure>',
-    '<Deactivate>',
-    '<Enter>',
-    '<Expose>',
-    '<FocusIn>',
-    '<FocusOut>',
-    '<Gravity>',
-    '<KeyPress>',
-    '<KeyRelease>',
-    '<Leave>',
-    '<Map>',
-    '<Motion>',
-    '<MouseWheel>',
-    '<Property>',
-    '<Reparent>',
-    '<Unmap>',
-    '<Visibility>',
+    "<Activate>",
+    "<ButtonPress>",
+    "<ButtonRelease>",
+    "<Circulate>",
+    "<Colormap>",
+    "<Configure>",
+    "<Deactivate>",
+    "<Enter>",
+    "<Expose>",
+    "<FocusIn>",
+    "<FocusOut>",
+    "<Gravity>",
+    "<KeyPress>",
+    "<KeyRelease>",
+    "<Leave>",
+    "<Map>",
+    "<Motion>",
+    "<MouseWheel>",
+    "<Property>",
+    "<Reparent>",
+    "<Unmap>",
+    "<Visibility>",
     "WM_DELETE_WINDOW",
 })
 
-EVENT_KEY = frozenset({'<KeyPress>', '<KeyRelease>'})
-EVENT_BUTTON = frozenset({'<ButtonPress>', '<ButtonRelease>'})
-EVENT_MOTION = frozenset({'<Enter>', '<Motion>', '<Leave>'})
+EVENT_KEY = frozenset({"<KeyPress>", "<KeyRelease>"})
+EVENT_BUTTON = frozenset({"<ButtonPress>", "<ButtonRelease>"})
+EVENT_MOTION = frozenset({"<Enter>", "<Motion>", "<Leave>"})
 PROT_DELETE = frozenset({"WM_DELETE_WINDOW"})
 
 
-class Events:
+class _EventHandler:
+    _event_queues = defaultdict(set)
+    _watching = Counter()
+    _handler_ids = {}
+    _event_waiters = defaultdict(list)
+    _lock = threading.Lock()
 
-    def __init__(self, waiters, *, blocking=True):
-        self.blocking = blocking
-        self._waiters = waiters
-        self._events = deque()
-        self._waiting = None
+    def __init__(self):
+        raise RuntimeError("Do not instantiate _EventHandler")
 
-    def __repr__(self):
-        waiting = (repr(self._waiting) if self._waiting else "NONE")
-        return f"<{type(self).__name__} waiting={waiting!r}>"
+    # Create a new tkinter.Event instance but for a protocol event
+    @staticmethod
+    def _create_protocol_event(widget, name, tm):
+        event = tkinter.Event()
 
-    async def wait(self):
-        await _event_wait(self)
+        # Informational attributes
+        event.time = int(tm*1000)
+        event.type = name
+        event.widget = widget
 
-    async def pop(self, *, blocking=None):
-        if blocking is None:
-            blocking = self.blocking
-        if not blocking:
-            return self._events.popleft()
-        while True:
-            try:
-                return self._events.popleft()
-            except IndexError:
-                await self.wait()
+        # Default attributes
+        event.char = "??"
+        event.delta = 0
+        event.height = "??"
+        event.keycode = "??"
+        event.keysym = "??"
+        event.keysym_num = "??"
+        event.num = "??"
+        event.serial = "??"
+        event.state = "??"
+        event.width = "??"
+        event.x = "??"
+        event.y = "??"
+        event.x_root = "??"
+        event.y_root = "??"
 
-    def __aiter__(self):
+        return event
+
+    # Factory function for event callbacks
+    @classmethod
+    def _create_callback(cls, widget, name):
+        def _event_callback(event=None):
+            if event is None:
+                event = cls._create_protocol_event(widget, name, monotonic())
+            for q in list(cls._event_queues[(widget, name)]):
+                q.put(event)
+                del q
+            for evtref in list(cls._event_waiters[(widget, name)]):
+                evt = evtref()
+                if evt is not None:
+                    evt.set()
+                del evt
+        return _event_callback
+
+    @classmethod
+    def watch(cls, events, queue_or_evt):
+        with cls._lock:
+            for widget, names in events.items():
+                for name in names:
+                    is_event = name.startswith("<")
+                    if not is_event:
+                        while widget.master and not hasattr(widget, "protocol"):
+                            widget = widget.master
+
+                    key = (widget, name)
+                    if cls._watching[key] == 0:
+                        callback = cls._create_callback(widget, name)
+                        if is_event:
+                            cls._handler_ids[key] = widget.bind(name, callback, "+")
+                        else:
+                            widget.protocol(name, callback)
+                            cls._handler_ids[key] = None
+                    cls._watching[key] += 1
+
+                    if isinstance(queue_or_evt, UniversalQueue):
+                        cls._event_queues[key].add(queue_or_evt)
+                    elif isinstance(queue_or_evt, UniversalEvent):
+                        cls._event_waiters[key].append(weakref.ref(queue_or_evt))
+
+    @classmethod
+    def unwatch(cls, events, queue_or_evt):
+        """
+        Detach a queue from a dict of widgets and events
+        """
+        with cls._lock:
+            for widget, names in events.items():
+                for name in names:
+                    is_event = name.startswith("<")
+                    if not is_event:
+                        while widget.master and not hasattr(widget, "protocol"):
+                            widget = widget.master
+
+                    key = (widget, name)
+                    cls._watching[key] -= 1
+                    if cls._watching[key] == 0:
+                        if is_event:
+                            widget.unbind(name, cls._handler_ids[key])
+                        elif name == "WM_DELETE_WINDOW":
+                            widget.protocol(name, widget.destroy)
+                        else:
+                            widget.protocol(name, lambda: None)
+
+                    if isinstance(queue_or_evt, UniversalQueue):
+                        cls._event_queues[key].discard(queue_or_evt)
+                    elif isinstance(queue_or_evt, UniversalEvent):
+                        cls._event_waiters[key] = [
+                            evt
+                            for evt in cls._event_waiters[key]
+                            if evt() is not None
+                        ]
+
+
+class EventQueue(UniversalQueue):
+    """
+    A queue for watching a given dictionary of widgets and events. This
+    is a subclass of UniversalQueue and is safe to use in Curio, Guio or
+    threads.
+    """
+
+    def __init__(self, events, maxsize=0, **kwargs):
+        assert maxsize == 0, "EventQueues must be unbounded"
+        super().__init__(**kwargs)
+        self._events = events
+        self._watching = False
+
+    def _get_noblock(self, default=None):
+        """
+        Convenience function for non-blocking gets. Returns an item from
+        the queue if available, default otherwise.
+        """
+        with self._mutex:
+            if not self._queue or self._getters:
+                return default
+            else:
+                item = self._get_item()
+                self._get_complete()
+                return item
+
+    def __enter__(self):
+        assert not self._watching
+        _EventHandler.watch(self._events, self)
+        self._watching = True
         return self
 
-    async def __anext__(self):
-        try:
-            return await self.pop()
-        except IndexError:
-            raise StopAsyncIteration
+    def __exit__(self, *args):
+        _EventHandler.unwatch(self._events, self)
+        self._watching = False
 
-    def __iter__(self):
-        return AWAIT(self.__aiter__)
+    async def __aenter__(self):
+        return self.__enter__()
 
-    def __next__(self):
-        try:
-            return AWAIT(self.__anext__)
-        except StopAsyncIteration:
-            raise StopIteration
+    async def __aexit__(self, *args):
+        return self.__exit__(*args)
+
+
+class EventWaiter(UniversalEvent):
+
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+        _EventHandler.watch(events, self)
+
+    def __del__(self):
+        _EventHandler.unwatch(self._events, self)

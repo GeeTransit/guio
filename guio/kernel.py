@@ -1,5 +1,4 @@
 import errno
-import logging
 import os
 import tkinter
 
@@ -23,6 +22,7 @@ from .utilities import *
 __all__ = ["Kernel", "run"]
 
 
+import logging
 logger = logging.getLogger(__name__)
 
 
@@ -45,11 +45,6 @@ class Kernel(_Kernel):
         self._toplevel = toplevel
         self._call_at_shutdown(lambda: destroy(self._toplevel))
 
-        def _close_window():
-            destroy(toplevel)
-            self._shutdown_funcs = None
-        toplevel.protocol("WM_DELETE_WINDOW", _close_window)
-
 
     def _make_kernel_runtime(kernel):
 
@@ -69,7 +64,6 @@ class Kernel(_Kernel):
         toplevel = kernel._toplevel
 
         # Internal kernel state
-        event_waiters = {}
         ready = deque()
         sleepq = TimeQueue()
         wake_queue = deque()
@@ -213,162 +207,6 @@ class Kernel(_Kernel):
                 selector_modify(fileobj, mask, data)
 
 
-        # --- Event helpers ---
-
-        # Create a new tkinter.Event instance but for a protocol event
-        def new_protocol_event(widget, name, tm):
-            event = tkinter.Event()
-            event.time = int(tm*1000)
-            event.type = name
-            event.widget = widget
-
-            event.char = "??"
-            event.delta = 0
-            event.height = "??"
-            event.keycode = "??"
-            event.keysym = "??"
-            event.keysym_num = "??"
-            event.num = "??"
-            event.serial = "??"
-            event.state = "??"
-            event.width = "??"
-            event.x = "??"
-            event.y = "??"
-            event.x_root = "??"
-            event.y_root = "??"
-
-            return event
-
-        # Add to event waiters and bind if new
-        def add_waiters(events):
-            if events._waiting:
-                raise EventResourceBusy(f"Multiple tasks can't wait on the same event queue {events}")
-
-            for widget, names in events._waiters.items():
-                for name in names:
-                    is_event = name.startswith("<")
-                    if not is_event:
-                        while widget.master and not hasattr(widget, "protocol"):
-                            widget = widget.master
-
-                    key = (widget, name)
-                    if key in event_waiters:
-                        events_set = event_waiters[key][1]
-                        events_set.add(events)
-                        continue
-
-                    events_set = {events}
-                    callback = send_event(widget, name, events_set)
-                    if is_event:
-                        bindid = widget.bind(name, callback, "+")
-                    else:
-                        widget.protocol(name, callback)
-                        bindid = None
-                    event_waiters[key] = (bindid, events_set)
-
-        # Remove from events waiters and unbind if empty
-        def remove_waiters(events):
-            for widget, names in events._waiters.items():
-                for name in names:
-                    is_event = name.startswith("<")
-                    if not is_event:
-                        while widget.master and not hasattr(widget, "protocol"):
-                            widget = widget.master
-
-                    key = (widget, name)
-                    assert key in event_waiters
-                    bindid, events_set = event_waiters[key]
-                    events_set.remove(events)
-
-                    if events_set:
-                        continue
-                    if widget is toplevel and name == "WM_DELETE_WINDOW":
-                        continue
-
-                    if exists(widget):
-                        if is_event:
-                            widget.unbind(name, bindid)
-                        else:
-                            widget.protocol(name, lambda: None)
-                    del event_waiters[key]
-
-
-        # --- Tkinter callback decorator ---
-
-        # Decorator to hide exceptions for tkinter callbacks
-        def callback(func):
-            @wraps(func)
-            def _wrapper(*args):
-                try:
-                    func(*args)
-                except BaseException as e:
-                    loop.throw(e)
-                else:
-                    return # "break"
-            return _wrapper
-
-
-        # --- Tkinter callbacks ---
-
-        # Factory for event callbacks
-        def send_event(widget, name, events_set):
-            @callback
-            def _event_callback(event=None):
-                if event is None:
-                    event = new_protocol_event(widget, name, monotonic())
-                for events in events_set:
-                    events._events.append(event)
-
-                if not loop.running:
-                    for events in list(events_set):
-                        if events._waiting:
-                            reschedule_task(events._waiting)
-                            events._waiting = None
-                        remove_waiters(events)
-
-                loop.send("EVENT_WAKE")
-
-            return _event_callback
-
-        # Factory for WM_DELETE_WINDOW protocol callbacks
-        def close_window(widget, name, events_set):
-            _last_close = None
-
-            @callback
-            def _event_callback():
-                nonlocal _last_close
-                if loop.closed:
-                    destroy(toplevel)
-                    kernel._shutdown_funcs = None
-                    return
-
-                if not events_set:
-                    destroy(toplevel)
-                    raise RuntimeError("Toplevel was closed")
-
-                now = monotonic()
-                if _last_close and _last_close + 0.5 > now:
-                    destroy(toplevel)
-                    raise RuntimeError("Kernel was force closed")
-                else:
-                    _last_close = now
-
-                event = new_protocol_event(widget, name, monotonic())
-                for events in events_set:
-                    events._events.append(event)
-
-                if not loop.running:
-                    for events in list(events_set):
-                        if events._waiting:
-                            reschedule_task(events._waiting)
-                            events._waiting = None
-                        remove_waiters(events)
-
-                loop.send("EVENT_WAKE")
-
-            return _event_callback
-
-
         # --- Trap decorator ---
 
         def blocking(func):
@@ -488,20 +326,6 @@ class Kernel(_Kernel):
 
             return now
 
-        @blocking
-        def trap_event_wait(events):
-            try:
-                add_waiters(events)
-            except GuioError as e:
-                return e
-            else:
-                events._waiting = current
-
-            def _cancel():
-                events._waiting = None
-                remove_waiters(events)
-            suspend_task("EVENT_WAIT", _cancel)
-
         def trap_get_kernel():
             return kernel
 
@@ -533,11 +357,6 @@ class Kernel(_Kernel):
         ]
         for act in _activations:
             act.activate(kernel)
-
-        # Bind toplevel "X" button
-        _events_set = set()
-        toplevel.protocol("WM_DELETE_WINDOW", close_window(toplevel, "WM_DELETE_WINDOW", _events_set))
-        event_waiters[(toplevel, "WM_DELETE_WINDOW")] = (None, _events_set)
 
 
         # --- Tkinter loop (run using tkinter's mainloop) ---
@@ -599,7 +418,7 @@ class Kernel(_Kernel):
                             selector_unregister(key.fileobj)
 
 
-                # --- Tkinter event waiting ---
+                # --- Tkinter event / future waiting ---
 
                 if ready or not main_task:
                     # A non-empty ready queue or an empty main task
@@ -618,7 +437,7 @@ class Kernel(_Kernel):
                     # complete in the future.
                     if (timeout is None) or (timeout > 0.1 and selector_getmap()):
                         timeout = 0.1
-                        data = "SELECT"
+                        data = "SELECT_WAKE"
 
                 # Schedule after callback if required
                 if timeout is not None:
@@ -627,14 +446,12 @@ class Kernel(_Kernel):
                         lambda data=data: loop.send(data)
                     )
 
-                # Wait for callback
-                try:
-                    data = (yield)
+                # Wait for a waking callback
+                data = (yield)
 
                 # Cancel after callback
-                finally:
-                    if timeout is not None:
-                        frame.after_cancel(id_)
+                if timeout is not None:
+                    frame.after_cancel(id_)
 
 
                 # --- Timeout handling ---
@@ -737,6 +554,11 @@ class Kernel(_Kernel):
             kernel_loop = _kernel_loop(work)
             del work
 
+            # Check that toplevel exists
+            if not exists(toplevel):
+                kernel._shutdown_funcs = None
+                raise RuntimeError("Toplevel doesn't exist")
+
             # Wrap loop with a frame
             frame = tkinter.Frame(toplevel)
             loop = _GenWrapper(kernel_loop, frame)
@@ -751,7 +573,7 @@ class Kernel(_Kernel):
 
                 # Continually recreate new frames to be used as a
                 # spawner for the tkinter's event loop.
-                while not loop.closed:
+                while exists(toplevel) and not loop.closed:
                     frame.wait_window()
 
                     # Check that the loop closed after `frame` was
@@ -853,7 +675,11 @@ class _GenWrapper:
 
             # Reschedule if called from within itself
             if self.running:
-                self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
+                try:
+                    self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
+                except RuntimeError as e:
+                    if "main thread is not in main loop" not in str(e):
+                        raise
                 return False
 
             # Only run if `gen` isn't closed
