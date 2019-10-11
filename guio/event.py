@@ -88,21 +88,30 @@ class _EventHandler:
     # Factory function for event callbacks
     @classmethod
     def _create_callback(cls, widget, name):
+        key = (widget, name)
+
+        # Callback function
         def _event_callback(event=None):
             if event is None:
                 event = cls._create_protocol_event(widget, name, monotonic())
-            for q in list(cls._event_queues[(widget, name)]):
+            elif str(event.type) is "VirtualEvent":
+                event.type = name[1:-1]
+            for q in list(cls._event_queues[key]):
                 q.put(event)
                 del q
-            for evtref in list(cls._event_waiters[(widget, name)]):
-                evt = evtref()
-                if evt is not None:
-                    evt.set()
-                del evt
+            for eventref in list(cls._event_waiters[key]):
+                event = eventref()
+                if event is not None:
+                    event.set()
+                del event
+
         return _event_callback
 
     @classmethod
-    def watch(cls, events, queue_or_evt):
+    def watch(cls, events, queue_or_event):
+        """
+        Attach a queue or event using a dict of widgets and events.
+        """
         with cls._lock:
             for widget, names in events.items():
                 for name in names:
@@ -121,15 +130,15 @@ class _EventHandler:
                             cls._handler_ids[key] = None
                     cls._watching[key] += 1
 
-                    if isinstance(queue_or_evt, UniversalQueue):
-                        cls._event_queues[key].add(queue_or_evt)
-                    elif isinstance(queue_or_evt, UniversalEvent):
-                        cls._event_waiters[key].append(weakref.ref(queue_or_evt))
+                    if isinstance(queue_or_event, UniversalQueue):
+                        cls._event_queues[key].add(queue_or_event)
+                    elif isinstance(queue_or_event, UniversalEvent):
+                        cls._event_waiters[key].append(weakref.ref(queue_or_event))
 
     @classmethod
-    def unwatch(cls, events, queue_or_evt):
+    def unwatch(cls, events, queue_or_event):
         """
-        Detach a queue from a dict of widgets and events
+        Detach a queue or event using a dict of widgets and events.
         """
         with cls._lock:
             for widget, names in events.items():
@@ -149,13 +158,13 @@ class _EventHandler:
                         else:
                             widget.protocol(name, lambda: None)
 
-                    if isinstance(queue_or_evt, UniversalQueue):
-                        cls._event_queues[key].discard(queue_or_evt)
-                    elif isinstance(queue_or_evt, UniversalEvent):
+                    if isinstance(queue_or_event, UniversalQueue):
+                        cls._event_queues[key].discard(queue_or_event)
+                    elif isinstance(queue_or_event, UniversalEvent):
                         cls._event_waiters[key] = [
-                            evt
-                            for evt in cls._event_waiters[key]
-                            if evt() is not None
+                            eventref
+                            for eventref in cls._event_waiters[key]
+                            if eventref() is not None
                         ]
 
 

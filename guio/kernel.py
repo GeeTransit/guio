@@ -28,22 +28,35 @@ logger = logging.getLogger(__name__)
 
 class Kernel(_Kernel):
     """
-    Guio run-time kernel.  The selector argument specifies a different
-    I/O selector. The debug argument specifies a list of debugger
-    objects to apply. The toplevel argument specifies a different
-    tkinter.Tk instance. For example:
+    Guio run-time kernel.  The selector argument specifies a different I/O
+    selector. The debug argument specifies a list of debugger objects to
+    apply. The toplevel argument specifies a different tkinter.Tk instance.
+    The select_interval specifies a wait between empty select calls. For
+    example:
         from curio.debug import schedtrace, traptrace
         k = Kernel(debug=[schedtrace, traptrace])
     Use the kernel run() method to submit work to the kernel.
     """
 
-    def __init__(self, *, selector=None, debug=None, activations=None, toplevel=None):
+    def __init__(
+        self,
+        *,
+        selector=None,
+        debug=None,
+        activations=None,
+        toplevel=None,
+        select_interval=None,
+    ):
         super().__init__(selector=selector, debug=debug, activations=activations)
 
         if toplevel is None:
             toplevel = tkinter.Tk()
         self._toplevel = toplevel
         self._call_at_shutdown(lambda: destroy(self._toplevel))
+
+        if select_interval is None:
+            select_interval = 0.1
+        self._select_interval = select_interval
 
 
     def _make_kernel_runtime(kernel):
@@ -68,6 +81,9 @@ class Kernel(_Kernel):
         sleepq = TimeQueue()
         wake_queue = deque()
         _activations = []
+
+        # Wait between empty select calls
+        select_interval = kernel._select_interval
 
 
         # --- Bound methods ---
@@ -98,8 +114,8 @@ class Kernel(_Kernel):
                 try:
                     wait_sock.recv(1000)
                 except BlockingIOError:
-                    # This may raise an error as the 1 ms delay in
-                    # tkinter's loop could cause the read to fail.
+                    # This may raise an error as the 1 ms delay in tkinter's loop could
+                    # cause the read to fail.
                     pass
 
                 while wake_queue:
@@ -360,9 +376,9 @@ class Kernel(_Kernel):
 
 
         # --- Tkinter loop (run using tkinter's mainloop) ---
-        # Note: A new inner loop is created for every piece of work that
-        # gets submitted to the kernel. Shared state is stored outside
-        # the inner loop to reduce slowdowns.
+        # Note: A new inner loop is created for every piece of work that gets
+        # submitted to the kernel. Shared state is stored outside the inner loop
+        # to reduce slowdowns.
 
         def _kernel_loop(coro):
 
@@ -388,8 +404,8 @@ class Kernel(_Kernel):
                     # Don't block here.
                     events = selector_select(0)
                 except OSError as e:
-                    # Windows throws an error if the selector is empty.
-                    # Ignore it and set events to an empty tuple.
+                    # Windows throws an error if the selector is empty. Ignore it and set
+                    # events to an empty tuple.
                     if e.errno != getattr(errno, "WSAEINVAL", None):
                         raise
                     events = ()
@@ -418,12 +434,11 @@ class Kernel(_Kernel):
                             selector_unregister(key.fileobj)
 
 
-                # --- Tkinter event / future waiting ---
+                # --- Tkinter event processing ---
 
                 if ready or not main_task:
-                    # A non-empty ready queue or an empty main task
-                    # means that the waiting should be as close to
-                    # non-blocking as possible.
+                    # A non-empty ready queue or an empty main task means that the waiting
+                    # should be as close to non-blocking as possible.
                     timeout = 0
                     data = "NON_BLOCKING"
 
@@ -433,10 +448,9 @@ class Kernel(_Kernel):
                     timeout = sleepq.next_deadline(now)
                     data = "SLEEP_WAKE"
 
-                    # Shorten timeouts if there is I/O that could
-                    # complete in the future.
-                    if (timeout is None) or (timeout > 0.1 and selector_getmap()):
-                        timeout = 0.1
+                    # Shorten timeouts if there is I/O that could complete in the future.
+                    if timeout and timeout > select_interval and selector_getmap():
+                        timeout = select_interval
                         data = "SELECT_WAKE"
 
                 # Schedule after callback if required
@@ -448,10 +462,6 @@ class Kernel(_Kernel):
 
                 # Wait for a waking callback
                 data = (yield)
-
-                # Cancel after callback
-                if timeout is not None:
-                    frame.after_cancel(id_)
 
 
                 # --- Timeout handling ---
@@ -564,20 +574,18 @@ class Kernel(_Kernel):
             loop = _GenWrapper(kernel_loop, frame)
 
             try:
-                # Run until loop's frame is destroyed. Note that
-                # `frame.wait_window` will spawn in tkinter's event loop
-                # but will return when the widget is destroyed. `frame`
-                # will be destroyed when the loop ends or when an
+                # Run until loop's frame is destroyed. Note that `frame.wait_window`
+                # will spawn in tkinter's event loop but will return when the widget is
+                # destroyed. `frame` will be destroyed when the loop ends or when an
                 # exception happens while sending a value to the loop.
                 loop.send(None)
 
-                # Continually recreate new frames to be used as a
-                # spawner for the tkinter's event loop.
+                # Continually recreate new frames to be used as a spawner for the
+                # tkinter's event loop.
                 while exists(toplevel) and not loop.closed:
                     frame.wait_window()
 
-                    # Check that the loop closed after `frame` was
-                    # destroyed.
+                    # Check that the loop closed after `frame` was destroyed.
                     if not loop.closed:
 
                         # Create new frame :D
@@ -600,8 +608,8 @@ class Kernel(_Kernel):
                 return loop.result
 
             except BaseException:
-                # If an exception happened in the loop, the kernel
-                # "crashes" and stops any further attempt to use it.
+                # If an exception happened in the loop, the kernel "crashes" and stops
+                # any further attempt to use it.
                 kernel._shutdown_funcs = None
                 raise
 
@@ -609,8 +617,15 @@ class Kernel(_Kernel):
 
 
 def run(
-    corofunc, *args, with_monitor=False, selector=None, debug=None,
-    activations=None, toplevel=None, **kernel_extra
+    corofunc,
+    *args,
+    with_monitor=False,
+    selector=None,
+    debug=None,
+    activations=None,
+    toplevel=None,
+    select_interval=None,
+    **kernel_extra,
 ):
     """
     Run the guio kernel with an initial task and execute until all tasks
@@ -629,6 +644,7 @@ def run(
         debug=debug,
         activations=activations,
         toplevel=toplevel,
+        select_interval=select_interval,
         **kernel_extra,
     )
 
@@ -675,11 +691,7 @@ class _GenWrapper:
 
             # Reschedule if called from within itself
             if self.running:
-                try:
-                    self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
-                except RuntimeError as e:
-                    if "main thread is not in main loop" not in str(e):
-                        raise
+                self._frame.after(1, lambda: _wrapper(self, *args, **kwargs))
                 return False
 
             # Only run if `gen` isn't closed
