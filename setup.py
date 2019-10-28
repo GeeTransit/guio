@@ -10,7 +10,7 @@ setup(
     license="MIT",
     version="0.10",
     author="George Zhang",
-    author_email="geetransit@example.com",
+    author_email="geetransit@gmail.com",
     url="https://github.com/GeeTransit/guio",
     packages=["guio"],
     install_requires=["curio"],
